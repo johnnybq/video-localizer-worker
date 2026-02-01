@@ -22,5 +22,4 @@ ENV TORCH_HOME=/workspace/models/torch
 
 EXPOSE 8080
 
-# Run server directly
 CMD ["python3", "-u", "handler_vast.py"]
