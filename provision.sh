@@ -28,4 +28,4 @@ pip install --no-cache-dir -r requirements.minimal.txt aiohttp
 
 # Start server
 echo "=== Starting Video Localizer Server ==="
-exec python -u handler_vast.py
+exec python3 -u handler_vast.py
