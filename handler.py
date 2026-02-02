@@ -219,13 +219,10 @@ class ModelManager:
         if name == "paddleocr":
             from paddleocr import PaddleOCR
             # Use 'en' for detection (works for Latin/Cyrillic scripts)
-            # PaddleOCR doesn't support 'multilingual' - use specific lang
-            # 'en' model detects text boxes well for most scripts
             return PaddleOCR(
                 use_gpu=True,
-                lang='en',  # Detection works for any script, recognition is English
-                show_log=False,
-                det_db_score_mode='slow'  # Better accuracy
+                lang='en',
+                show_log=False
             )
 
         elif name == "sam2":
