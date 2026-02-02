@@ -218,12 +218,9 @@ class ModelManager:
 
         if name == "paddleocr":
             from paddleocr import PaddleOCR
-            # Use 'en' for detection (works for Latin/Cyrillic scripts)
-            # Note: PaddleOCR doesn't support show_log param in newer versions
-            return PaddleOCR(
-                use_gpu=True,
-                lang='en'
-            )
+            # Use 'ru' for Cyrillic text detection
+            # PaddleOCR 3.x doesn't support use_gpu/show_log params
+            return PaddleOCR(lang='ru')
 
         elif name == "sam2":
             from sam2.sam2_video_predictor import SAM2VideoPredictor
