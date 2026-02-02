@@ -15,10 +15,11 @@ WORKDIR /app
 COPY handler.py handler_vast.py worker.py start-server.sh requirements.minimal.txt ./
 
 # Install Python deps
-# Note: Install pandas FIRST with binary wheel to avoid NumPy 2.x build issues
-# Then install vastai (which depends on pandas)
-RUN pip install --no-cache-dir pandas==2.2.3 && \
-    pip install --no-cache-dir -r requirements.minimal.txt aiohttp vastai
+# Fix NumPy version first (vastai base has NumPy 2.x which breaks pandas build)
+# Then install pandas binary wheel, then other deps
+RUN pip install --no-cache-dir "numpy<2" && \
+    pip install --no-cache-dir pandas && \
+    pip install --no-cache-dir -r requirements.minimal.txt aiohttp
 
 # Make start script executable
 RUN chmod +x start-server.sh
