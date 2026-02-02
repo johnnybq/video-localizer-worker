@@ -42,7 +42,23 @@ class LocalizationPayload:
     quality_threshold: float = 0.6
     stages: Optional[list] = None
     callback_url: Optional[str] = None
+
+    # Inpainting model: "videopainter" (default, better quality) or "propainter" (faster)
+    inpaint_model: str = "videopainter"
+
+    # Pre-translated text (simple string)
     translated_text: Optional[str] = None
+
+    # Full translation data from API (Gemini 3 Pro VideoAnalyzer)
+    # If provided, skips transcribe AND translate stages
+    # Format:
+    # {
+    #   "transcript": [{"start": 0.0, "end": 2.5, "text": "..."}],
+    #   "text_overlays": [{"text": "...", "translated": "...", "appears_at_seconds": 2.5, ...}],
+    #   "voice_script": [{"text": "...", "emotion": "energetic"}],
+    #   "subtitle_style": {"font_family": "Montserrat", "text_color": "#FFFFFF", ...}
+    # }
+    translation_data: Optional[Dict[str, Any]] = None
 
     @classmethod
     def for_test(cls) -> "LocalizationPayload":
