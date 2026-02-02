@@ -33,6 +33,6 @@ ENV TORCH_HOME=/workspace/models/torch
 
 EXPOSE 8080
 
-# Use our start script (Vast.ai will NOT override this with ENTRYPOINT [])
+# Run standalone HTTP server directly (no PyWorker dependency)
 ENTRYPOINT []
-CMD ["/app/start-server.sh"]
+CMD ["python3", "-u", "handler_vast.py"]
