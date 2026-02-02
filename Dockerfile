@@ -22,4 +22,6 @@ ENV TORCH_HOME=/workspace/models/torch
 
 EXPOSE 8080
 
+# Override Vast.ai entrypoint to run our server directly
+ENTRYPOINT []
 CMD ["python3", "-u", "handler_vast.py"]
