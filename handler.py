@@ -54,18 +54,17 @@ logger = logging.getLogger(__name__)
 
 class PipelineStage(Enum):
     """Video localization pipeline stages."""
-    PREPROCESS = "preprocess"          # Audio separation (Demucs)
+    PREPROCESS = "preprocess"          # NEW: Audio separation
     DETECT_TEXT = "detect_text"        # PaddleOCR
     CREATE_MASK = "create_mask"        # SAM 2.1
-    INPAINT = "inpaint"                # VideoPainter (default) / ProPainter
-    TRANSCRIBE = "transcribe"          # Faster-Whisper (skipped if translation_data provided)
-    TRANSLATE = "translate"            # Argos fallback (skipped if translation_data provided)
-    TTS = "tts"                        # F5-TTS voice cloning
+    INPAINT = "inpaint"                # VideoPainter
+    TRANSCRIBE = "transcribe"          # Faster-Whisper
+    TRANSLATE = "translate"            # NLLB / Argos
+    TTS = "tts"                        # F5-TTS
     LIPSYNC = "lipsync"                # VideoRetalking / MuseTalk
-    RENDER_SUBTITLES = "render_subtitles"  # Market-specific subtitle rendering
-    ENHANCE = "enhance"                # GFPGAN face enhancement
+    ENHANCE = "enhance"                # NEW: GFPGAN face enhancement
     UPSCALE = "upscale"                # Real-ESRGAN
-    QUALITY_CHECK = "quality_check"    # Auto quality assessment
+    QUALITY_CHECK = "quality_check"    # NEW: Auto quality assessment
     ASSEMBLE = "assemble"              # Final mix
 
 
@@ -84,23 +83,9 @@ class JobConfig:
     stages: Optional[List[str]] = None
     callback_url: Optional[str] = None
 
-    # Inpainting model: "videopainter" (default, better quality) or "propainter" (faster)
-    inpaint_model: str = "videopainter"
-
     # Pre-translated text (from server's TranslatorAgent / Gemini 3 Pro)
     # If provided, skips local translate stage
     translated_text: Optional[str] = None
-
-    # Full translation data from API (Gemini 3 Pro VideoAnalyzer)
-    # If provided, skips transcribe AND translate stages
-    # Format:
-    # {
-    #   "transcript": [{"start": 0.0, "end": 2.5, "text": "...", "words": [...]}],
-    #   "text_overlays": [{"text": "...", "translated": "...", "appears_at_seconds": 2.5, "disappears_at_seconds": 8.0, "position": "center"}],
-    #   "voice_script": [{"text": "...", "emotion": "energetic", "pace": "normal"}],
-    #   "subtitle_style": {"font_family": "Montserrat", "font_weight": "bold", "text_color": "#FFFFFF", ...}
-    # }
-    translation_data: Optional[Dict[str, Any]] = None
 
     # R2 storage config
     r2_bucket: str = "trafficplant"
@@ -233,9 +218,12 @@ class ModelManager:
 
         if name == "paddleocr":
             from paddleocr import PaddleOCR
+            # Use 'en' for detection (works for Latin/Cyrillic scripts)
+            # PaddleOCR doesn't support 'multilingual' - use specific lang
+            # 'en' model detects text boxes well for most scripts
             return PaddleOCR(
                 use_gpu=True,
-                lang='multilingual',
+                lang='en',  # Detection works for any script, recognition is English
                 show_log=False,
                 det_db_score_mode='slow'  # Better accuracy
             )
@@ -529,16 +517,9 @@ def _render_mask_video(video_path: str, masks: Dict[int, np.ndarray], output_pat
     out.release()
 
 
-def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, model: str = "videopainter") -> str:
-    """Remove text using VideoPainter (default) or ProPainter (fallback).
-
-    Args:
-        video_path: Input video path
-        mask_path: Mask video path (areas to inpaint)
-        mm: Model manager
-        model: "videopainter" (default, better quality) or "propainter" (faster)
-    """
-    logger.info(f"Stage: INPAINT (model={model})")
+def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager) -> str:
+    """Remove text using ProPainter (fallback) or VideoPainter."""
+    logger.info("Stage: INPAINT")
 
     if mask_path is None:
         logger.info("No mask, skipping inpainting")
@@ -546,31 +527,20 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, model: str 
 
     output_path = video_path.replace(".mp4", "_inpainted.mp4")
 
-    if model == "videopainter":
-        # Try VideoPainter first (better quality, default)
-        try:
-            with mm.use("videopainter") as videopainter:
-                return _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
-        except Exception as e:
-            logger.warning(f"VideoPainter failed: {e}, falling back to ProPainter")
-            # Fallback to ProPainter
-            try:
-                return _inpaint_propainter(video_path, mask_path, output_path)
-            except Exception as e2:
-                logger.error(f"ProPainter also failed: {e2}")
-                return video_path
-    else:
-        # ProPainter mode
-        try:
-            return _inpaint_propainter(video_path, mask_path, output_path)
-        except Exception as e:
-            logger.warning(f"ProPainter failed: {e}, trying VideoPainter")
-            try:
-                with mm.use("videopainter") as videopainter:
-                    return _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
-            except Exception as e2:
-                logger.error(f"VideoPainter also failed: {e2}")
-                return video_path
+    # Try ProPainter first (more reliable, simpler interface)
+    try:
+        return _inpaint_propainter(video_path, mask_path, output_path)
+    except Exception as e:
+        logger.warning(f"ProPainter failed: {e}, trying VideoPainter")
+
+    # Fallback to VideoPainter
+    try:
+        with mm.use("videopainter") as videopainter:
+            return _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
+    except Exception as e:
+        logger.error(f"VideoPainter also failed: {e}")
+        # Return original as last resort
+        return video_path
 
 
 def _inpaint_propainter(video_path: str, mask_path: str, output_path: str) -> str:
@@ -942,159 +912,6 @@ def stage_upscale(video_path: str, mm: ModelManager, scale: int = 2) -> str:
     return output_path
 
 
-def stage_render_subtitles(
-    video_path: str,
-    text_overlays: List[Dict],
-    subtitle_style: Dict,
-    output_path: str = None
-) -> str:
-    """
-    Render translated subtitles with market-specific styling.
-
-    Args:
-        video_path: Input video (should be inpainted/clean)
-        text_overlays: List of text overlays with timing from Gemini
-            [{"text": "original", "translated": "...", "appears_at_seconds": 2.5,
-              "disappears_at_seconds": 8.0, "position": "center"}]
-        subtitle_style: Style spec from Gemini for target market
-            {"font_family": "Montserrat", "font_weight": "bold", "text_color": "#FFFFFF",
-             "outline_color": "#000000", "outline_width": 3, "position": "bottom", ...}
-        output_path: Output video path
-    """
-    logger.info(f"Stage: RENDER_SUBTITLES ({len(text_overlays)} overlays)")
-
-    if not text_overlays:
-        logger.info("No text overlays to render")
-        return video_path
-
-    import cv2
-    from PIL import Image, ImageDraw, ImageFont
-
-    output_path = output_path or video_path.replace(".mp4", "_subtitled.mp4")
-
-    # Get video properties
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # Parse style
-    font_family = subtitle_style.get("font_family", "DejaVuSans")
-    font_weight = subtitle_style.get("font_weight", "bold")
-    font_size = subtitle_style.get("font_size", int(height * 0.05))  # 5% of height
-    text_color = subtitle_style.get("text_color", "#FFFFFF")
-    outline_color = subtitle_style.get("outline_color", "#000000")
-    outline_width = subtitle_style.get("outline_width", 2)
-    position = subtitle_style.get("position", "bottom")  # top, center, bottom
-    has_background = subtitle_style.get("has_background_box", False)
-    bg_color = subtitle_style.get("background_color", "#000000")
-    bg_opacity = subtitle_style.get("background_opacity", 0.5)
-
-    # Try to load font
-    try:
-        font_path = f"/usr/share/fonts/truetype/{font_family.lower()}/{font_family}-{'Bold' if font_weight == 'bold' else 'Regular'}.ttf"
-        font = ImageFont.truetype(font_path, font_size)
-    except:
-        # Fallback to default
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-        except:
-            font = ImageFont.load_default()
-
-    # Convert hex colors to RGB
-    def hex_to_rgb(hex_color):
-        hex_color = hex_color.lstrip('#')
-        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
-    text_rgb = hex_to_rgb(text_color)
-    outline_rgb = hex_to_rgb(outline_color)
-    bg_rgb = hex_to_rgb(bg_color)
-
-    # Create output video
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-    # Build frame → overlays map
-    frame_overlays = {}
-    for overlay in text_overlays:
-        start_frame = int(overlay.get("appears_at_seconds", 0) * fps)
-        end_frame = int(overlay.get("disappears_at_seconds", frame_count / fps) * fps)
-
-        for f in range(start_frame, min(end_frame, frame_count)):
-            if f not in frame_overlays:
-                frame_overlays[f] = []
-            frame_overlays[f].append(overlay)
-
-    # Process frames
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx in frame_overlays:
-            # Convert to PIL for text rendering
-            frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            draw = ImageDraw.Draw(frame_pil)
-
-            for overlay in frame_overlays[frame_idx]:
-                text = overlay.get("translated", overlay.get("text", ""))
-                pos = overlay.get("position", position)
-
-                # Calculate text position
-                bbox = draw.textbbox((0, 0), text, font=font)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
-
-                x = (width - text_width) // 2
-
-                if pos == "top":
-                    y = int(height * 0.1)
-                elif pos == "center":
-                    y = (height - text_height) // 2
-                else:  # bottom
-                    y = int(height * 0.85) - text_height
-
-                # Draw background box if needed
-                if has_background:
-                    padding = 10
-                    bg_box = [x - padding, y - padding, x + text_width + padding, y + text_height + padding]
-                    # Create semi-transparent background
-                    overlay_img = Image.new('RGBA', frame_pil.size, (0, 0, 0, 0))
-                    overlay_draw = ImageDraw.Draw(overlay_img)
-                    overlay_draw.rectangle(bg_box, fill=(*bg_rgb, int(255 * bg_opacity)))
-                    frame_pil = Image.alpha_composite(frame_pil.convert('RGBA'), overlay_img).convert('RGB')
-                    draw = ImageDraw.Draw(frame_pil)
-
-                # Draw outline (stroke effect)
-                for dx in range(-outline_width, outline_width + 1):
-                    for dy in range(-outline_width, outline_width + 1):
-                        if dx != 0 or dy != 0:
-                            draw.text((x + dx, y + dy), text, font=font, fill=outline_rgb)
-
-                # Draw main text
-                draw.text((x, y), text, font=font, fill=text_rgb)
-
-            # Convert back to OpenCV
-            frame = cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
-
-        out.write(frame)
-        frame_idx += 1
-
-        if frame_idx % 100 == 0:
-            logger.info(f"Rendered {frame_idx}/{frame_count} frames")
-
-    cap.release()
-    out.release()
-
-    # Copy audio from original
-    _copy_audio(video_path, output_path)
-
-    logger.info(f"Subtitles rendered to {output_path}")
-    return output_path
-
-
 def stage_quality_check(video_path: str, threshold: float) -> Dict:
     """NEW: Assess output quality, reject if too low."""
     logger.info("Stage: QUALITY_CHECK")
@@ -1184,8 +1001,9 @@ class R2Storage:
         import boto3
 
         self.bucket = os.getenv("R2_BUCKET", "trafficplant")
-        self.endpoint = os.getenv("R2_ENDPOINT", "https://44ae186edf696abef73b6a0e280eb833.r2.cloudflarestorage.com")
-        self.public_url = os.getenv("R2_PUBLIC_URL", "https://pub-c025ef96f40e47aab26156a1874f64bc.r2.dev")
+        # Correct Cloudflare account ID: e66ac290473eeddb1a026d180d738f30
+        self.endpoint = os.getenv("R2_ENDPOINT", "https://e66ac290473eeddb1a026d180d738f30.r2.cloudflarestorage.com")
+        self.public_url = os.getenv("R2_PUBLIC_URL", "https://pub-e66ac290473eeddb1a026d180d738f30.r2.dev")
 
         self.client = boto3.client(
             "s3",
@@ -1304,16 +1122,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             quality_threshold=job_input.get("quality_threshold", 0.6),
             stages=job_input.get("stages"),
             callback_url=job_input.get("callback_url"),
-            inpaint_model=job_input.get("inpaint_model", "videopainter"),  # videopainter (default) or propainter
-            translated_text=job_input.get("translated_text"),  # Pre-translated from server (simple string)
-            translation_data=job_input.get("translation_data"),  # Full data from Gemini (with timing, styles)
+            translated_text=job_input.get("translated_text"),  # Pre-translated from server
         )
-
-        # Log if using pre-computed translation data from API
-        if config.translation_data:
-            logger.info("Using translation_data from API (Gemini 3 Pro) - skipping transcribe/translate stages")
-        elif config.translated_text:
-            logger.info("Using translated_text from API - skipping translate stage")
 
         mm = get_model_manager()
         metrics = mm.metrics
@@ -1341,27 +1151,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "transcript": None
         }
 
-        # Pre-populate state from translation_data if provided
-        if config.translation_data:
-            td = config.translation_data
-            # Extract transcript from API data
-            if "transcript" in td:
-                state["transcript"] = {
-                    "language": td.get("source_language", config.source_language),
-                    "segments": td["transcript"],
-                    "full_text": " ".join(seg.get("text", "") for seg in td["transcript"])
-                }
-            # Extract voice script for TTS
-            if "voice_script" in td:
-                state["voice_script"] = td["voice_script"]
-                state["translated_text"] = " ".join(seg.get("text", "") for seg in td["voice_script"])
-            # Extract text overlays for subtitle rendering
-            if "text_overlays" in td:
-                state["text_overlays"] = td["text_overlays"]
-            # Extract subtitle style
-            if "subtitle_style" in td:
-                state["subtitle_style"] = td["subtitle_style"]
-
         # Execute pipeline
         for stage_name in stages:
             t0 = time.time()
@@ -1373,14 +1162,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     state["background_path"] = result["background_path"]
 
                 elif stage_name == "detect_text":
-                    # Skip if we have text_overlays from API (Gemini already extracted them)
-                    if state.get("text_overlays"):
-                        logger.info("Skipping detect_text - using text_overlays from API")
-                        # Convert API format to detection format for mask creation
-                        state["text_detections"] = []  # Mask will use text_overlays directly
-                    else:
-                        result = stage_detect_text(state["video_path"], mm)
-                        state["text_detections"] = result["detections"]
+                    result = stage_detect_text(state["video_path"], mm)
+                    state["text_detections"] = result["detections"]
 
                 elif stage_name == "create_mask":
                     state["mask_path"] = stage_create_mask(
@@ -1393,29 +1176,22 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     state["video_path"] = stage_inpaint(
                         state["video_path"],
                         state["mask_path"],
-                        mm,
-                        model=config.inpaint_model  # Use configured model (default: videopainter)
+                        mm
                     )
 
                 elif stage_name == "transcribe":
-                    # Skip if translation_data already has transcript from API
-                    if config.translation_data and "transcript" in config.translation_data:
-                        logger.info("Skipping transcribe - using transcript from API (Gemini 3 Pro)")
-                    else:
-                        state["transcript"] = stage_transcribe(
-                            state["video_path"],
-                            state.get("vocals_path"),
-                            mm
-                        )
+                    state["transcript"] = stage_transcribe(
+                        state["video_path"],
+                        state.get("vocals_path"),
+                        mm
+                    )
 
                 elif stage_name == "translate":
-                    # Skip if translation_data already has translations from API
-                    if config.translation_data:
-                        logger.info("Skipping translate - using translations from API (Gemini 3 Pro)")
-                    elif config.translated_text:
-                        logger.info("Using pre-translated text from server")
+                    # Use pre-translated text from server (Gemini 3 Pro) if provided
+                    if config.translated_text:
+                        logger.info("Using pre-translated text from server (Gemini 3 Pro)")
                         state["translated_text"] = config.translated_text
-                    elif state.get("transcript"):
+                    elif state["transcript"]:
                         # Fallback to local Argos Translate
                         src_lang = state["transcript"]["language"]
                         if src_lang != config.target_language:
@@ -1443,17 +1219,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                             config.lipsync_quality,
                             mm
                         )
-
-                elif stage_name == "render_subtitles":
-                    # Render translated subtitles with market-specific styling
-                    if state.get("text_overlays") and state.get("subtitle_style"):
-                        state["video_path"] = stage_render_subtitles(
-                            state["video_path"],
-                            state["text_overlays"],
-                            state["subtitle_style"]
-                        )
-                    else:
-                        logger.info("Skipping render_subtitles - no text_overlays or subtitle_style")
 
                 elif stage_name == "enhance":
                     if config.face_enhance:
