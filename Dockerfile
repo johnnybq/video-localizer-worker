@@ -1,11 +1,12 @@
 # Video Localizer - Vast.ai Serverless with PyWorker
 FROM vastai/pytorch:2.10.0-cuda-13.0.2-py312-24.04
 
-# Install system deps
+# Install system deps + python symlink (needed for pandas build)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     curl \
+    python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
