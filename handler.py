@@ -219,10 +219,10 @@ class ModelManager:
         if name == "paddleocr":
             from paddleocr import PaddleOCR
             # Use 'en' for detection (works for Latin/Cyrillic scripts)
+            # Note: PaddleOCR doesn't support show_log param in newer versions
             return PaddleOCR(
                 use_gpu=True,
-                lang='en',
-                show_log=False
+                lang='en'
             )
 
         elif name == "sam2":
