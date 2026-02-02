@@ -1,4 +1,4 @@
-# Video Localizer - Vast.ai Serverless
+# Video Localizer - Vast.ai Serverless with PyWorker
 FROM vastai/pytorch:2.10.0-cuda-13.0.2-py312-24.04
 
 # Install system deps
@@ -10,11 +10,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy handler files
-COPY handler.py handler_vast.py requirements.minimal.txt ./
+# Copy all files
+COPY handler.py handler_vast.py worker.py start-server.sh requirements.minimal.txt ./
 
-# Install Python deps
-RUN pip install --no-cache-dir -r requirements.minimal.txt aiohttp
+# Install Python deps (including vastai SDK for PyWorker)
+RUN pip install --no-cache-dir -r requirements.minimal.txt aiohttp vastai
+
+# Make start script executable
+RUN chmod +x start-server.sh
+
+# Create log directory
+RUN mkdir -p /var/log/portal
 
 # Environment
 ENV HF_HOME=/workspace/models/huggingface
@@ -22,6 +28,6 @@ ENV TORCH_HOME=/workspace/models/torch
 
 EXPOSE 8080
 
-# Override Vast.ai entrypoint to run our server directly
+# Use our start script (Vast.ai will NOT override this with ENTRYPOINT [])
 ENTRYPOINT []
-CMD ["python3", "-u", "handler_vast.py"]
+CMD ["/app/start-server.sh"]
