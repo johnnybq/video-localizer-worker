@@ -367,7 +367,8 @@ def stage_detect_text(video_path: str, mm: ModelManager) -> Dict:
         if not ret:
             break
 
-        result = ocr.ocr(frame, cls=True)
+        # PaddleOCR 3.x: no cls parameter
+        result = ocr.ocr(frame)
         if result and result[0]:
             for line in result[0]:
                 bbox = line[0]
