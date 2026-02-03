@@ -218,9 +218,15 @@ class ModelManager:
 
         if name == "paddleocr":
             from paddleocr import PaddleOCR
-            # Use 'ru' for Cyrillic text detection
-            # PaddleOCR 3.x doesn't support use_gpu/show_log params
-            return PaddleOCR(lang='ru')
+            # Use 'en' for detection (works for Latin/Cyrillic scripts)
+            # PaddleOCR doesn't support 'multilingual' - use specific lang
+            # 'en' model detects text boxes well for most scripts
+            return PaddleOCR(
+                use_gpu=True,
+                lang='en',  # Detection works for any script, recognition is English
+                show_log=False,
+                det_db_score_mode='slow'  # Better accuracy
+            )
 
         elif name == "sam2":
             from sam2.sam2_video_predictor import SAM2VideoPredictor
@@ -367,8 +373,7 @@ def stage_detect_text(video_path: str, mm: ModelManager) -> Dict:
         if not ret:
             break
 
-        # PaddleOCR 3.x: no cls parameter
-        result = ocr.ocr(frame)
+        result = ocr.ocr(frame, cls=False)
         if result and result[0]:
             for line in result[0]:
                 bbox = line[0]
@@ -998,13 +1003,22 @@ class R2Storage:
         self.bucket = os.getenv("R2_BUCKET", "trafficplant")
         # Correct Cloudflare account ID: e66ac290473eeddb1a026d180d738f30
         self.endpoint = os.getenv("R2_ENDPOINT", "https://e66ac290473eeddb1a026d180d738f30.r2.cloudflarestorage.com")
-        self.public_url = os.getenv("R2_PUBLIC_URL", "https://pub-e66ac290473eeddb1a026d180d738f30.r2.dev")
+        self.public_url = os.getenv("R2_PUBLIC_URL", "https://pub-c025ef96f40e47aab26156a1874f64bc.r2.dev")
+
+        access_key = os.getenv("R2_ACCESS_KEY") or os.getenv("AWS_ACCESS_KEY_ID")
+        secret_key = os.getenv("R2_SECRET_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+
+        if not access_key or not secret_key:
+            raise RuntimeError(
+                "R2 credentials missing. Set R2_ACCESS_KEY/R2_SECRET_KEY "
+                "or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
+            )
 
         self.client = boto3.client(
             "s3",
             endpoint_url=self.endpoint,
-            aws_access_key_id=os.getenv("R2_ACCESS_KEY"),
-            aws_secret_access_key=os.getenv("R2_SECRET_KEY"),
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
             region_name="auto"
         )
 
@@ -1121,6 +1135,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         mm = get_model_manager()
+        mm.metrics = PipelineMetrics()  # Reset metrics for each request
         metrics = mm.metrics
 
         # Download video
