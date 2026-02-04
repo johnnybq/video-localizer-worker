@@ -8,19 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20  # Should complete in ~3-5 min with base image
 
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo docker system prune -af
-          df -h
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -33,13 +23,65 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Check if base image exists
+        id: check_base
+        run: |
+          if docker manifest inspect johnnybq/video-localizer-base:v1 > /dev/null 2>&1; then
+            echo "base_exists=true" >> $GITHUB_OUTPUT
+            echo "Base image found: johnnybq/video-localizer-base:v1"
+          else
+            echo "base_exists=false" >> $GITHUB_OUTPUT
+            echo "WARNING: Base image not found, will use full Dockerfile"
+          fi
+
+      - name: Build and push (fast path - using base image)
+        if: steps.check_base.outputs.base_exists == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: Dockerfile
           push: true
           tags: |
             johnnybq/video-localizer:latest
             johnnybq/video-localizer:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build and push (slow path - full build, base not available)
+        if: steps.check_base.outputs.base_exists == 'false'
+        run: |
+          echo "Building full image from Dockerfile.base + Dockerfile..."
+
+          # Free disk space for full build
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+          df -h
+
+          # Build base locally
+          docker build -f Dockerfile.base -t johnnybq/video-localizer-base:v1 .
+
+          # Build final image
+          docker build -f Dockerfile -t johnnybq/video-localizer:latest .
+          docker tag johnnybq/video-localizer:latest johnnybq/video-localizer:${{ github.sha }}
+
+          # Push both
+          docker push johnnybq/video-localizer-base:v1
+          docker push johnnybq/video-localizer:latest
+          docker push johnnybq/video-localizer:${{ github.sha }}
+
+      - name: Summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check_base.outputs.base_exists }}" == "true" ]; then
+            echo "- **Build type:** Fast (using base image)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Build type:** Full (base image was missing)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- **Image:** \`johnnybq/video-localizer:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA tag:** \`johnnybq/video-localizer:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
