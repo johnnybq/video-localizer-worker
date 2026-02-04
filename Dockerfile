@@ -36,7 +36,8 @@ RUN pip install --no-cache-dir "numpy<2" && \
 # VideoPainter requires a modified diffusers with CogVideoXI2VDualInpaintAnyLPipeline
 RUN git clone --depth 1 https://github.com/TencentARC/VideoPainter.git /opt/videopainter && \
     cd /opt/videopainter/diffusers && \
-    pip install --no-cache-dir -e .
+    pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir --upgrade transformers peft
 
 # Download VideoPainter checkpoints (context encoder + LoRA adapter)
 # Models are cached in /workspace/models for persistence across runs
