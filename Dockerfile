@@ -5,6 +5,7 @@
 # Build time: ~2-3 minutes (just copies handler files)
 #
 # Requires: johnnybq/video-localizer-base:v1 (built separately)
+# NOTE: Upgrade to v2 when base image build completes (will have VideoPainter)
 # ==============================================================================
 FROM johnnybq/video-localizer-base:v1
 

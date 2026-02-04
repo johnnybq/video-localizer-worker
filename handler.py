@@ -923,84 +923,77 @@ def _find_overlay_bbox(
     video_height: int,
 ) -> Tuple[int, int, int, int]:
     """
-    Find pixel bounding box for an overlay by matching against OCR detections.
+    Find pixel bounding box for an overlay based on OCR detections in the target region.
 
-    Strategy:
-    1. Filter OCR detections by position (top half / bottom half based on overlay.position)
-    2. Try fuzzy-matching overlay text against filtered detections
-    3. If matches found, union all matched bboxes with generous padding
-    4. Fallback: use position hints with dynamic sizing based on text length
+    SIMPLE STRATEGY: Don't try to match text - just use ALL OCR detections in the region.
+    The overlay's position hint (top/bottom) tells us which region to look at.
 
     Returns (x, y, w, h) in pixels.
     """
-    from difflib import SequenceMatcher
-
-    original_text = overlay.get("text", "")
     position = overlay.get("position", "top")
-    matched_bboxes = []
+    original_text = overlay.get("text", "")[:50]  # For logging
 
-    # First, filter detections by vertical region based on position hint
+    # Filter detections by vertical region
+    # Use generous boundaries to catch text that might be near the edge
     if position == "top":
-        region_detections = [d for d in text_detections if d.get("bbox_norm", [0, 0, 0, 0])[1] < 0.5]
+        # Top region: y < 45% of video height
+        region_detections = [d for d in text_detections
+                            if d.get("bbox_norm", [0, 0.5, 0, 0.5])[1] < 0.45]
     elif position == "bottom":
-        region_detections = [d for d in text_detections if d.get("bbox_norm", [0, 0, 0, 0])[1] > 0.4]
+        # Bottom region: y > 55% of video height
+        region_detections = [d for d in text_detections
+                            if d.get("bbox_norm", [0, 0.5, 0, 0.5])[1] > 0.55]
     else:
+        # Center or unknown: use all detections
         region_detections = text_detections
 
-    # Try fuzzy-matching overlay text against region detections
-    for det in region_detections:
-        det_text = det.get("text", "")
-        if not det_text or len(det_text) < 2:
-            continue
+    logger.info(f"RENDER_TEXT: Position '{position}' - found {len(region_detections)} OCR detections in region (total: {len(text_detections)})")
 
-        # Check if detection text is a substring or fuzzy match
-        score = SequenceMatcher(None, original_text.lower(), det_text.lower()).ratio()
+    if region_detections:
+        # Use UNION of ALL detections in the region
+        # This ensures we cover all text, even if OCR split it into multiple boxes
+        bboxes = [d["bbox_norm"] for d in region_detections if "bbox_norm" in d]
 
-        # Also check if det_text is contained in overlay text (OCR splits lines)
-        if det_text.lower() in original_text.lower() and len(det_text) > 2:
-            score = max(score, 0.6)
+        if bboxes:
+            x_min = min(b[0] for b in bboxes)
+            y_min = min(b[1] for b in bboxes)
+            x_max = max(b[2] for b in bboxes)
+            y_max = max(b[3] for b in bboxes)
 
-        # Check for word overlap
-        det_words = set(det_text.lower().split())
-        overlay_words = set(original_text.lower().split())
-        if det_words & overlay_words:  # Any common words
-            score = max(score, 0.5)
+            # Add VERY GENEROUS padding to fully cover original text + background
+            # Instagram/TikTok text boxes often have rounded corners and padding
+            box_width = x_max - x_min
+            box_height = y_max - y_min
 
-        if score > 0.25:  # Lower threshold to catch partial matches
-            matched_bboxes.append(det["bbox_norm"])
+            # Horizontal: extend to nearly full width for better coverage
+            pad_x = max(0.05, box_width * 0.3)  # At least 5% padding
+            # Vertical: generous padding for multi-line text
+            pad_y = max(0.02, box_height * 0.4)  # At least 2% padding
 
-    # If no text matches but we have detections in the region, use ALL of them
-    # (better to cover more than miss the original text)
-    if not matched_bboxes and region_detections:
-        logger.info(f"RENDER_TEXT: No text match for '{original_text[:30]}...', using all {len(region_detections)} detections in {position} region")
-        matched_bboxes = [d["bbox_norm"] for d in region_detections]
+            x_min = max(0, x_min - pad_x)
+            y_min = max(0, y_min - pad_y)
+            x_max = min(1.0, x_max + pad_x)
+            y_max = min(1.0, y_max + pad_y)
 
-    if matched_bboxes:
-        # Union all matched bboxes into one region
-        x_min = min(b[0] for b in matched_bboxes)
-        y_min = min(b[1] for b in matched_bboxes)
-        x_max = max(b[2] for b in matched_bboxes)
-        y_max = max(b[3] for b in matched_bboxes)
+            # Convert to pixels
+            x = int(x_min * video_width)
+            y = int(y_min * video_height)
+            w = int((x_max - x_min) * video_width)
+            h = int((y_max - y_min) * video_height)
 
-        # Add GENEROUS padding to fully cover the original background box
-        # The original might have rounded corners, shadows, etc.
-        pad_x = (x_max - x_min) * 0.25
-        pad_y = (y_max - y_min) * 0.35
-        x_min = max(0, x_min - pad_x)
-        y_min = max(0, y_min - pad_y)
-        x_max = min(1.0, x_max + pad_x)
-        y_max = min(1.0, y_max + pad_y)
+            # Ensure minimum dimensions
+            w = max(w, int(video_width * 0.8))  # At least 80% width
+            h = max(h, int(video_height * 0.12))  # At least 12% height
 
-        x = int(x_min * video_width)
-        y = int(y_min * video_height)
-        w = int((x_max - x_min) * video_width)
-        h = int((y_max - y_min) * video_height)
+            # Re-center if width was expanded
+            if w > (x_max - x_min) * video_width:
+                x = max(0, (video_width - w) // 2)
 
-        logger.info(f"RENDER_TEXT: Found bbox from {len(matched_bboxes)} OCR matches: ({x}, {y}, {w}x{h})")
-        return (x, y, w, h)
+            logger.info(f"RENDER_TEXT: Using OCR union bbox: ({x}, {y}, {w}x{h}) from {len(bboxes)} detections")
+            return (x, y, w, h)
 
-    # Fallback: use position hints from Gemini manifest with dynamic sizing
-    logger.warning(f"RENDER_TEXT: No OCR matches for '{original_text[:30]}...', using fallback position '{position}'")
+    # Fallback: use position hints with very generous sizing
+    logger.warning(f"RENDER_TEXT: No OCR in '{position}' region for '{original_text}...', using fallback")
 
     translated_text = overlay.get("translated_text", original_text)
     margin = int(video_width * 0.03)  # 3% margin
