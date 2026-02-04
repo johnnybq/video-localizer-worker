@@ -281,8 +281,8 @@ class ModelManager:
             return model
 
         elif name == "f5tts":
-            # F5-TTS loading
-            from f5_tts import F5TTS
+            # F5-TTS loading (v1.x API)
+            from f5_tts.api import F5TTS
             return F5TTS(device=self.device)
 
         elif name == "videopainter":
@@ -540,9 +540,12 @@ def stage_create_mask(video_path: str, detections: List[Dict], mm: ModelManager)
     # Propagate masks through video
     mask_frames = {}
     for frame_idx, obj_ids, masks in sam2.propagate_in_video(inference_state):
-        # Combine all object masks
-        combined_mask = np.zeros(masks.shape[1:], dtype=np.uint8)
-        for mask in masks:
+        # masks: torch.Tensor (num_objects, H, W) or (num_objects, 1, H, W)
+        masks_np = masks.cpu().numpy()
+        if masks_np.ndim == 4:
+            masks_np = masks_np.squeeze(1)  # (N, 1, H, W) → (N, H, W)
+        combined_mask = np.zeros(masks_np.shape[1:], dtype=np.uint8)
+        for mask in masks_np:
             combined_mask = np.maximum(combined_mask, (mask > 0.5).astype(np.uint8) * 255)
         mask_frames[frame_idx] = combined_mask
 
@@ -961,15 +964,13 @@ def _tts_f5(text: str, reference_audio: str, mm: ModelManager) -> str:
     f5 = mm.load("f5tts")
     output_path = tempfile.mktemp(suffix=".wav")
 
-    audio = f5.infer(
-        ref_audio=reference_audio,
+    wav, sr, _ = f5.infer(
+        ref_file=reference_audio,
         ref_text="",  # Auto-transcribe reference
         gen_text=text,
-        speed=1.0
+        file_wave=output_path,
+        seed=None,
     )
-
-    import torchaudio
-    torchaudio.save(output_path, audio, 24000)
 
     return output_path
 

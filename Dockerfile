@@ -67,6 +67,7 @@ from demucs_infer.pretrained import get_model; print('demucs-infer OK'); \
 import kornia; print('kornia OK'); \
 from peft import PeftModel; print('peft OK'); \
 import pyiqa; print('pyiqa OK'); \
+from f5_tts.api import F5TTS; print('f5-tts OK'); \
 print('All critical imports verified.') \
 "
 
