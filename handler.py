@@ -825,7 +825,7 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
                 },
                 json={
                     "text": text,
-                    "model_id": "eleven_turbo_v2_5",
+                    "model_id": "eleven_v3",
                     "voice_settings": {
                         "stability": 0.5,
                         "similarity_boost": 0.85,
