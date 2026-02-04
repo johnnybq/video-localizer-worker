@@ -29,13 +29,28 @@ import sys
 import time
 import json
 import logging
+import shutil
 import tempfile
 import subprocess
+import types
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from contextlib import contextmanager
+
+# =============================================================================
+# Monkey-patch: torchvision.transforms.functional_tensor
+# Removed in torchvision 0.20+, but gfpgan/basicsr still import it.
+# Must be applied BEFORE any gfpgan/basicsr import.
+# =============================================================================
+try:
+    from torchvision.transforms.functional_tensor import rgb_to_grayscale  # noqa
+except ImportError:
+    from torchvision.transforms.functional import rgb_to_grayscale
+    _ft = types.ModuleType("torchvision.transforms.functional_tensor")
+    _ft.rgb_to_grayscale = rgb_to_grayscale
+    sys.modules["torchvision.transforms.functional_tensor"] = _ft
 
 import torch
 import numpy as np
@@ -65,18 +80,23 @@ def set_progress_callback(fn):
 
 class PipelineStage(Enum):
     """Video localization pipeline stages."""
-    PREPROCESS = "preprocess"          # NEW: Audio separation
+    PREPROCESS = "preprocess"          # Audio separation (demucs)
     DETECT_TEXT = "detect_text"        # PaddleOCR
     CREATE_MASK = "create_mask"        # SAM 2.1
-    INPAINT = "inpaint"                # VideoPainter
+    INPAINT = "inpaint"                # VideoPainter (TencentARC)
     TRANSCRIBE = "transcribe"          # Faster-Whisper
-    TRANSLATE = "translate"            # NLLB / Argos
-    TTS = "tts"                        # F5-TTS
+    TRANSLATE = "translate"            # Server-side (Gemini 3 Pro)
+    TTS = "tts"                        # ElevenLabs → F5-TTS
     LIPSYNC = "lipsync"                # VideoRetalking / MuseTalk
-    ENHANCE = "enhance"                # NEW: GFPGAN face enhancement
+    ENHANCE = "enhance"                # GFPGAN face enhancement
     UPSCALE = "upscale"                # Real-ESRGAN
-    QUALITY_CHECK = "quality_check"    # NEW: Auto quality assessment
+    QUALITY_CHECK = "quality_check"    # Auto quality assessment
     ASSEMBLE = "assemble"              # Final mix
+
+
+# Stages that MUST succeed for the job to produce a valid localized video.
+# If any of these fail, the job returns status="error" instead of "success".
+CRITICAL_STAGES = {"transcribe", "translate", "tts", "assemble"}
 
 
 @dataclass
@@ -266,11 +286,33 @@ class ModelManager:
             return F5TTS(device=self.device)
 
         elif name == "videopainter":
-            # VideoPainter with CogVideoX base
-            from diffusers import CogVideoXPipeline
-            pipe = CogVideoXPipeline.from_pretrained(
-                "THUDM/CogVideoX-5b-I2V",
-                torch_dtype=torch.float16
+            # VideoPainter (TencentARC) — proper mask-guided video inpainting
+            # Uses custom CogVideoXI2VDualInpaintAnyLPipeline from their diffusers fork
+            vp_root = os.environ.get("VIDEOPAINTER_ROOT", "/opt/videopainter")
+            vp_ckpt = os.environ.get("VIDEOPAINTER_CKPT", "/workspace/models/videopainter/checkpoints")
+            sys.path.insert(0, vp_root)
+
+            from diffusers import CogVideoXTransformer3DModel
+            from diffusers.pipelines.cogvideo.pipeline_cogvideox_i2v_dual_inpaint_anyl import (
+                CogVideoXI2VDualInpaintAnyLPipeline,
+            )
+
+            model_path = os.path.join(os.environ.get("HF_HOME", "/workspace/models/huggingface"),
+                                       "THUDM/CogVideoX-5b-I2V")
+            # Download base model if not cached
+            if not os.path.exists(model_path):
+                model_path = "THUDM/CogVideoX-5b-I2V"
+
+            branch_path = os.path.join(vp_ckpt, "checkpoints", "branch")
+
+            transformer = CogVideoXTransformer3DModel.from_pretrained(
+                model_path, subfolder="transformer", torch_dtype=torch.bfloat16
+            )
+            pipe = CogVideoXI2VDualInpaintAnyLPipeline.from_pretrained(
+                model_path,
+                branch=branch_path if os.path.exists(branch_path) else None,
+                transformer=transformer,
+                torch_dtype=torch.bfloat16,
             ).to(self.device)
             pipe.enable_xformers_memory_efficient_attention()
             return pipe
@@ -654,47 +696,95 @@ def _inpaint_replicate(video_path: str, mask_path: str, output_path: str) -> str
 
 
 def _inpaint_videopainter(video_path: str, mask_path: str, output_path: str, pipe) -> str:
-    """Inpaint using VideoPainter (CogVideoX-based)."""
+    """Inpaint using VideoPainter (TencentARC) — mask-guided CogVideoX inpainting."""
     import cv2
     from PIL import Image
 
-    # VideoPainter requires specific format
-    # Extract frames, apply inpainting model, reassemble
-
+    # Extract video frames as PIL images
     cap = cv2.VideoCapture(video_path)
-    mask_cap = cv2.VideoCapture(mask_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Get first frame as reference
-    ret, first_frame = cap.read()
-    first_frame_pil = Image.fromarray(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
+    video_frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Apply mask to frame (black out inpaint regions)
+        pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        video_frames.append(pil)
+    cap.release()
 
-    # Generate inpainted video with CogVideoX
-    # Note: This uses the diffusion pipeline for video generation
-    video_frames = pipe(
-        prompt="",  # No text prompt, just inpaint
-        image=first_frame_pil,
-        num_frames=min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 49),  # CogVideoX limit
-        num_inference_steps=20,
-        guidance_scale=3.0,
-    ).frames[0]
+    # Extract mask frames as binary PIL images
+    mask_cap = cv2.VideoCapture(mask_path)
+    mask_frames = []
+    while True:
+        ret, frame = mask_cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+        mask_pil = Image.fromarray(gray)
+        mask_frames.append(mask_pil)
+    mask_cap.release()
 
-    # Write output
+    # Pad mask_frames to match video length
+    while len(mask_frames) < len(video_frames):
+        mask_frames.append(mask_frames[-1] if mask_frames else Image.new("L", (width, height), 0))
+
+    # Create masked video frames (black out inpaint regions)
+    masked_frames = []
+    for vf, mf in zip(video_frames, mask_frames):
+        v_np = np.array(vf)
+        m_np = np.array(mf.resize(vf.size))
+        # Zero out masked regions
+        v_np[m_np > 128] = 0
+        masked_frames.append(Image.fromarray(v_np))
+
+    # Limit to 49 frames (CogVideoX constraint), process in chunks for longer videos
+    max_frames = 49
+    all_output_frames = []
+
+    for chunk_start in range(0, len(video_frames), max_frames):
+        chunk_end = min(chunk_start + max_frames, len(video_frames))
+        chunk_masked = masked_frames[chunk_start:chunk_end]
+        chunk_masks = mask_frames[chunk_start:chunk_end]
+
+        inpaint_out = pipe(
+            prompt="",
+            image=chunk_masked[0],
+            num_videos_per_prompt=1,
+            num_inference_steps=20,
+            num_frames=len(chunk_masked),
+            use_dynamic_cfg=True,
+            guidance_scale=6.0,
+            generator=torch.Generator().manual_seed(42),
+            video=chunk_masked,
+            masks=chunk_masks,
+            strength=1.0,
+            output_type="np",
+        )
+
+        chunk_frames = inpaint_out.frames[0] if hasattr(inpaint_out, 'frames') else inpaint_out[0]
+        all_output_frames.extend(chunk_frames)
+
+    # Write output video
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    for frame in video_frames:
-        frame_np = np.array(frame)
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+    for frame in all_output_frames:
+        if isinstance(frame, Image.Image):
+            frame = np.array(frame)
+        if frame.dtype == np.float32 or frame.dtype == np.float64:
+            frame = (frame * 255).clip(0, 255).astype(np.uint8)
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame.shape[-1] == 3 else frame
         frame_resized = cv2.resize(frame_bgr, (width, height))
         out.write(frame_resized)
 
-    cap.release()
-    mask_cap.release()
     out.release()
 
+    # Copy original audio to inpainted video
     _copy_audio(video_path, output_path)
 
     return output_path
@@ -764,33 +854,16 @@ def stage_transcribe(video_path: str, vocals_path: str, mm: ModelManager) -> Dic
 
 def stage_translate(text: str, source_lang: str, target_lang: str) -> str:
     """
-    FALLBACK: Translate text using Argos Translate (local, free).
-
-    NOTE: In production, translation should be done on the main server
-    using TranslatorAgent (Gemini 3 Pro) for better quality.
-    Pass pre-translated text via 'translated_text' input parameter.
+    Translation is done SERVER-SIDE via Gemini 3 Pro (TranslatorAgent).
+    The translated text must be passed via 'translated_text' in the job payload.
+    This function should never be called directly — if it is, it means
+    the server didn't provide translated text, which is a pipeline error.
     """
-    logger.info(f"Stage: TRANSLATE ({source_lang} → {target_lang}) [FALLBACK - Argos]")
-    logger.warning("Using local Argos Translate. For better quality, use server-side TranslatorAgent (Gemini 3 Pro)")
-
-    import argostranslate.package
-    import argostranslate.translate
-
-    # Ensure language package is installed
-    argostranslate.package.update_package_index()
-    available = argostranslate.package.get_available_packages()
-
-    # Find matching package
-    for pkg in available:
-        if pkg.from_code == source_lang and pkg.to_code == target_lang:
-            if not pkg.installed:
-                argostranslate.package.install_from_path(pkg.download())
-            break
-
-    # Translate
-    translated = argostranslate.translate.translate(text, source_lang, target_lang)
-
-    return translated
+    raise RuntimeError(
+        f"No translated text provided by server. "
+        f"Translation must be done server-side via TranslatorAgent (Gemini 3 Pro). "
+        f"Source: {source_lang}, Target: {target_lang}, Text length: {len(text)}"
+    )
 
 
 def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en") -> Optional[str]:
@@ -1014,37 +1087,44 @@ def stage_upscale(video_path: str, mm: ModelManager, scale: int = 2) -> str:
 
 
 def stage_quality_check(video_path: str, threshold: float) -> Dict:
-    """NEW: Assess output quality, reject if too low."""
-    logger.info("Stage: QUALITY_CHECK")
+    """Assess output quality using no-reference metric (MUSIQ)."""
+    logger.info("Stage: QUALITY_CHECK (MUSIQ no-reference)")
 
     import pyiqa
-
-    # Load quality metrics
-    lpips_metric = pyiqa.create_metric('lpips', device='cuda')
-
-    # Sample frames and compute quality
     import cv2
+
+    # MUSIQ: no-reference image quality metric (0-100 scale)
+    try:
+        metric = pyiqa.create_metric('musiq', device='cuda')
+    except Exception:
+        # Fallback to NIQE if MUSIQ unavailable
+        metric = pyiqa.create_metric('niqe', device='cuda')
+        logger.info("Using NIQE metric (MUSIQ unavailable)")
+
     cap = cv2.VideoCapture(video_path)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sample_step = max(1, frame_count // 10)
 
     scores = []
-    for i in range(0, frame_count, frame_count // 10):
+    for i in range(0, frame_count, sample_step):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i)
         ret, frame = cap.read()
         if ret:
-            # Convert to tensor
-            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
             frame_tensor = frame_tensor.unsqueeze(0).cuda()
 
-            # Compute perceptual quality (lower is better for LPIPS)
-            # Using self-comparison as baseline
-            score = 1.0 - lpips_metric(frame_tensor, frame_tensor).item()
-            scores.append(score)
+            score = metric(frame_tensor).item()
+            # MUSIQ returns 0-100, normalize to 0-1
+            normalized = score / 100.0 if score > 1.0 else score
+            scores.append(normalized)
 
     cap.release()
 
     avg_score = sum(scores) / len(scores) if scores else 0
     passed = avg_score >= threshold
+
+    logger.info(f"Quality: {avg_score:.3f} (threshold: {threshold}, {'PASS' if passed else 'FAIL'})")
 
     return {
         "score": avg_score,
@@ -1056,37 +1136,47 @@ def stage_quality_check(video_path: str, threshold: float) -> Dict:
 
 def stage_assemble(
     video_path: str,
-    tts_audio: str,
-    background_audio: str,
+    tts_audio: Optional[str],
+    background_audio: Optional[str],
     output_path: str
 ) -> str:
     """Assemble final video with mixed audio."""
     logger.info("Stage: ASSEMBLE")
 
-    # Mix TTS voice with background audio
-    mixed_audio = output_path.replace(".mp4", "_mixed.wav")
+    if not tts_audio:
+        raise RuntimeError("No TTS audio available — cannot assemble localized video")
 
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", tts_audio,
-        "-i", background_audio,
-        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:weights=1 0.3[a]",
-        "-map", "[a]",
-        mixed_audio
-    ], capture_output=True)
+    if background_audio and os.path.exists(background_audio):
+        # Mix TTS voice with background audio
+        mixed_audio = output_path.replace(".mp4", "_mixed.wav")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", tts_audio,
+            "-i", background_audio,
+            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:weights=1 0.3[a]",
+            "-map", "[a]",
+            mixed_audio
+        ], capture_output=True, check=False)
+        audio_to_use = mixed_audio if os.path.exists(mixed_audio) else tts_audio
+    else:
+        # No background audio — use TTS audio directly
+        audio_to_use = tts_audio
 
-    # Combine video with mixed audio
+    # Combine video with audio
     subprocess.run([
         "ffmpeg", "-y",
         "-i", video_path,
-        "-i", mixed_audio,
+        "-i", audio_to_use,
         "-c:v", "copy",
         "-c:a", "aac",
         "-map", "0:v",
         "-map", "1:a",
         "-shortest",
         output_path
-    ], capture_output=True)
+    ], capture_output=True, check=False)
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"ffmpeg assemble failed — output not created: {output_path}")
 
     return output_path
 
@@ -1263,14 +1353,32 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         }
 
         # Execute pipeline
+        critical_failure = None  # Set if a CRITICAL stage fails
+
         for stage_name in stages:
+            if critical_failure:
+                break  # Stop pipeline on critical failure
+
             t0 = time.time()
 
             try:
                 if stage_name == "preprocess":
-                    result = stage_preprocess(state["video_path"], mm)
-                    state["vocals_path"] = result["vocals_path"]
-                    state["background_path"] = result["background_path"]
+                    # Graceful: extract raw audio if demucs fails
+                    try:
+                        result = stage_preprocess(state["video_path"], mm)
+                        state["vocals_path"] = result["vocals_path"]
+                        state["background_path"] = result["background_path"]
+                    except Exception as e:
+                        logger.warning(f"Audio separation failed: {e}, extracting raw audio")
+                        raw_audio = state["video_path"].replace(".mp4", "_raw_audio.wav")
+                        subprocess.run([
+                            "ffmpeg", "-y", "-i", state["video_path"],
+                            "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+                            raw_audio
+                        ], capture_output=True, check=False)
+                        if os.path.exists(raw_audio):
+                            state["vocals_path"] = raw_audio
+                        metrics.errors.append(f"preprocess: {e} (fallback to raw audio)")
 
                 elif stage_name == "detect_text":
                     result = stage_detect_text(state["video_path"], mm)
@@ -1298,29 +1406,33 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     )
 
                 elif stage_name == "translate":
-                    # Use pre-translated text from server (Gemini 3 Pro) if provided
+                    # Translation MUST be provided by server (Gemini 3 Pro)
                     if config.translated_text:
                         logger.info("Using pre-translated text from server (Gemini 3 Pro)")
                         state["translated_text"] = config.translated_text
-                    elif state["transcript"]:
-                        # Fallback to local Argos Translate
+                    elif state.get("transcript"):
                         src_lang = state["transcript"]["language"]
-                        if src_lang != config.target_language:
-                            state["translated_text"] = stage_translate(
-                                state["transcript"]["full_text"],
-                                src_lang,
-                                config.target_language
-                            )
-                        else:
+                        tgt_lang = config.target_language.split("-")[0]  # pt-BR → pt
+                        if src_lang == tgt_lang:
                             state["translated_text"] = state["transcript"]["full_text"]
+                        else:
+                            # No server translation and languages differ — critical error
+                            raise RuntimeError(
+                                f"Server must provide translated_text for {src_lang}→{config.target_language}. "
+                                f"Local translation removed — use TranslatorAgent (Gemini 3 Pro)."
+                            )
+                    else:
+                        raise RuntimeError("No transcript available for translation")
 
                 elif stage_name == "tts":
                     if config.voice_clone and state.get("translated_text"):
                         state["tts_audio"] = stage_tts(
                             state["translated_text"],
-                            state.get("vocals_path", video_path),
+                            state.get("vocals_path") or video_path,
                             mm
                         )
+                    elif not state.get("translated_text"):
+                        raise RuntimeError("No translated text available for TTS")
 
                 elif stage_name == "lipsync":
                     if config.lipsync and state.get("tts_audio"):
@@ -1346,13 +1458,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     metrics.quality_scores = qc_result
                     if not qc_result["passed"]:
-                        raise ValueError(f"Quality check failed: {qc_result['score']:.2f} < {qc_result['threshold']}")
+                        logger.warning(f"Quality check failed: {qc_result['score']:.2f} < {qc_result['threshold']}")
 
                 elif stage_name == "assemble":
                     output_path = video_path.replace(".mp4", "_final.mp4")
                     state["video_path"] = stage_assemble(
                         state["video_path"],
-                        state.get("tts_audio", state.get("vocals_path")),
+                        state.get("tts_audio"),
                         state.get("background_path"),
                         output_path
                     )
@@ -1360,10 +1472,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as e:
                 logger.error(f"Stage {stage_name} failed: {e}")
                 metrics.errors.append(f"{stage_name}: {str(e)}")
-                # Continue with next stage if possible
+
+                if stage_name in CRITICAL_STAGES:
+                    critical_failure = f"Critical stage '{stage_name}' failed: {e}"
+                    logger.error(f"CRITICAL FAILURE: {critical_failure}")
+                # Optional stages: continue
 
             metrics.stage_times[stage_name] = time.time() - t0
-            logger.info(f"Stage {stage_name} completed in {metrics.stage_times[stage_name]:.1f}s")
+            logger.info(f"Stage {stage_name} {'FAILED' if stage_name in [e.split(':')[0] for e in metrics.errors] else 'OK'} in {metrics.stage_times[stage_name]:.1f}s")
 
             # Fire progress callback if registered
             if _progress_callback:
@@ -1371,6 +1487,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     _progress_callback(stage_name, metrics.stage_times[stage_name], metrics.errors)
                 except Exception:
                     pass  # Never let callback failures break the pipeline
+
+        # If critical stage failed — return error WITHOUT uploading
+        if critical_failure:
+            return {
+                "status": "error",
+                "error": critical_failure,
+                "metrics": metrics.to_dict(),
+                "transcript": state.get("transcript"),
+            }
 
         # Upload result to R2
         try:
@@ -1380,7 +1505,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             output_url = r2.upload(state["video_path"], remote_key)
         except Exception as e:
             logger.error(f"R2 upload failed: {e}")
-            # Return local path as fallback (useful for debugging)
             output_url = f"file://{state['video_path']}"
             metrics.errors.append(f"r2_upload: {str(e)}")
 
@@ -1388,6 +1512,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         logger.info(f"=" * 60)
         logger.info(f"Job {job_id} completed in {total_time:.1f}s")
+        logger.info(f"Errors: {len(metrics.errors)} (non-critical)")
         logger.info(f"=" * 60)
 
         return {
