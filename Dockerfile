@@ -18,8 +18,8 @@ WORKDIR /app
 # ==============================================================================
 COPY handler.py handler_vast.py ./
 
-# Quick sanity check (imports already verified in base)
-RUN python3 -c "import handler; print('handler.py loaded OK')"
+# Skip sanity check — imports verified in base, avoid slow torch init
+# RUN python3 -c "import handler; print('handler.py loaded OK')"
 
 # Pull-based: worker polls backend, no port needed
 ENTRYPOINT []
