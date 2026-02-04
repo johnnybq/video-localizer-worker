@@ -1759,6 +1759,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"Job {job_id} started")
     logger.info(f"=" * 60)
 
+    # Run VideoPainter diagnostics on first job (lazy init)
+    diag = get_videopainter_diagnostics()
+    if diag and diag.get("errors"):
+        logger.warning(f"VideoPainter issues: {diag['errors']}")
+
     start_time = time.time()
 
     # Validate input
@@ -2017,16 +2022,25 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # RunPod entry point
-# Run VideoPainter diagnostics on module load
+# VideoPainter diagnostics - run lazily on first job, not at import time
+# (import-time diagnostics break Docker build sanity check)
 _videopainter_diag = None
-try:
-    _videopainter_diag = diagnose_videopainter()
-    if _videopainter_diag["errors"]:
-        logger.warning(f"VideoPainter diagnostics: {len(_videopainter_diag['errors'])} issues found")
-    else:
-        logger.info("VideoPainter diagnostics: All components OK")
-except Exception as e:
-    logger.error(f"VideoPainter diagnostics failed: {e}")
+
+
+def get_videopainter_diagnostics() -> Dict[str, Any]:
+    """Get cached VideoPainter diagnostics, running them on first call."""
+    global _videopainter_diag
+    if _videopainter_diag is None:
+        try:
+            _videopainter_diag = diagnose_videopainter()
+            if _videopainter_diag["errors"]:
+                logger.warning(f"VideoPainter diagnostics: {len(_videopainter_diag['errors'])} issues found")
+            else:
+                logger.info("VideoPainter diagnostics: All components OK")
+        except Exception as e:
+            logger.error(f"VideoPainter diagnostics failed: {e}")
+            _videopainter_diag = {"errors": [str(e)]}
+    return _videopainter_diag
 
 
 if __name__ == "__main__":
