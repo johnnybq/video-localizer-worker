@@ -84,6 +84,7 @@ class PipelineStage(Enum):
     DETECT_TEXT = "detect_text"        # PaddleOCR
     CREATE_MASK = "create_mask"        # SAM 2.1
     INPAINT = "inpaint"                # VideoPainter (TencentARC)
+    RENDER_TEXT = "render_text"        # Draw translated text overlays (ffmpeg)
     TRANSCRIBE = "transcribe"          # Faster-Whisper
     TRANSLATE = "translate"            # Server-side (Gemini 3 Pro)
     TTS = "tts"                        # ElevenLabs → F5-TTS
@@ -117,6 +118,13 @@ class JobConfig:
     # Pre-translated text (from server's TranslatorAgent / Gemini 3 Pro)
     # If provided, skips local translate stage
     translated_text: Optional[str] = None
+
+    # Pre-translated on-screen text overlays (from server)
+    # Each dict: {text, translated_text, appears_at, disappears_at, position, font_style, ...}
+    translated_overlays: Optional[List[Dict]] = None
+
+    # Original subtitle style from Gemini manifest (font, color, background, etc.)
+    subtitle_style: Optional[Dict] = None
 
     # R2 storage config
     r2_bucket: str = "trafficplant"
@@ -822,6 +830,254 @@ def _copy_audio(source_video: str, target_video: str):
     shutil.move(temp_output, target_video)
 
 
+def _find_overlay_bbox(
+    overlay: Dict,
+    text_detections: List[Dict],
+    video_width: int,
+    video_height: int,
+) -> Tuple[int, int, int, int]:
+    """
+    Find pixel bounding box for an overlay by matching against OCR detections.
+
+    Returns (x, y, w, h) in pixels.
+    Falls back to position hints (top/bottom/center) if no OCR match.
+    """
+    from difflib import SequenceMatcher
+
+    original_text = overlay.get("text", "")
+    best_match_score = 0.0
+    matched_bboxes = []
+
+    # Try fuzzy-matching overlay text against OCR detections
+    for det in text_detections:
+        det_text = det.get("text", "")
+        # Check if detection text is a substring or fuzzy match
+        score = SequenceMatcher(None, original_text.lower(), det_text.lower()).ratio()
+        # Also check if det_text is contained in overlay text (OCR splits lines)
+        if det_text.lower() in original_text.lower() and len(det_text) > 3:
+            score = max(score, 0.7)
+        if score > 0.3:
+            matched_bboxes.append(det["bbox_norm"])
+
+    if matched_bboxes:
+        # Union all matched bboxes into one region
+        x_min = min(b[0] for b in matched_bboxes)
+        y_min = min(b[1] for b in matched_bboxes)
+        x_max = max(b[2] for b in matched_bboxes)
+        y_max = max(b[3] for b in matched_bboxes)
+
+        # Add padding (15% on each side) to cover the original background box
+        pad_x = (x_max - x_min) * 0.15
+        pad_y = (y_max - y_min) * 0.20
+        x_min = max(0, x_min - pad_x)
+        y_min = max(0, y_min - pad_y)
+        x_max = min(1.0, x_max + pad_x)
+        y_max = min(1.0, y_max + pad_y)
+
+        x = int(x_min * video_width)
+        y = int(y_min * video_height)
+        w = int((x_max - x_min) * video_width)
+        h = int((y_max - y_min) * video_height)
+        return (x, y, w, h)
+
+    # Fallback: use position hints from Gemini manifest
+    position = overlay.get("position", "top")
+    margin = int(video_width * 0.05)
+    box_w = int(video_width * 0.90)
+    box_h = int(video_height * 0.15)
+    x = margin
+
+    if position == "top":
+        y = int(video_height * 0.05)
+    elif position == "bottom":
+        y = int(video_height * 0.75)
+    elif position == "center":
+        y = int(video_height * 0.40)
+    else:
+        y = int(video_height * 0.05)
+
+    return (x, y, box_w, box_h)
+
+
+def _estimate_text_height(text: str, font_size: int, box_width: int) -> int:
+    """Estimate how many lines the text will wrap to and total height needed."""
+    # Approximate: ~0.6 * font_size per character width (monospace estimate)
+    chars_per_line = max(1, int(box_width / (font_size * 0.52)))
+    words = text.split()
+    lines = 1
+    current_line_len = 0
+    for word in words:
+        if current_line_len + len(word) + 1 > chars_per_line and current_line_len > 0:
+            lines += 1
+            current_line_len = len(word)
+        else:
+            current_line_len += len(word) + 1
+    return int(lines * font_size * 1.3)  # 1.3 line spacing
+
+
+def stage_render_text(
+    video_path: str,
+    translated_overlays: List[Dict],
+    text_detections: List[Dict],
+    resolution: Tuple[int, int],
+    fps: float,
+    subtitle_style: Optional[Dict] = None,
+) -> str:
+    """
+    Render translated text overlays onto video using ffmpeg drawbox + drawtext.
+
+    Strategy based on font_style:
+    - "rounded_background" (most TikTok/Reels): Draw opaque box covering original + translated text
+    - Other: Draw text with thin border/shadow (assumes inpaint already removed original)
+
+    Uses ffmpeg filter_complex with enable='between(t,start,end)' for timing.
+    Zero VRAM — pure CPU/ffmpeg.
+    """
+    logger.info(f"Stage: RENDER_TEXT ({len(translated_overlays)} overlays)")
+
+    if not translated_overlays:
+        logger.info("No overlays to render, skipping")
+        return video_path
+
+    video_width, video_height = resolution
+    output_path = video_path.replace(".mp4", "_textrendered.mp4")
+
+    # Find a suitable font (Noto Sans covers most languages)
+    font_candidates = [
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    font_path = None
+    for f in font_candidates:
+        if os.path.exists(f):
+            font_path = f
+            break
+
+    # Build ffmpeg filter chain
+    filters = []
+
+    for i, overlay in enumerate(translated_overlays):
+        translated_text = overlay.get("translated_text", "")
+        if not translated_text:
+            continue
+
+        font_style = overlay.get("font_style", "rounded_background")
+        appears_at = overlay.get("appears_at", 0.0)
+        disappears_at = overlay.get("disappears_at", 0.0)
+        if disappears_at <= appears_at:
+            disappears_at = appears_at + 5.0  # default 5s display
+
+        # Get bounding box for this overlay
+        x, y, box_w, box_h = _find_overlay_bbox(
+            overlay, text_detections, video_width, video_height
+        )
+
+        # Calculate font size to fit text in box
+        # Start with size based on box height, then check if text fits width
+        font_size = min(40, max(16, int(box_h * 0.18)))
+
+        # Check if translated text fits — if not, reduce font size or expand box
+        needed_height = _estimate_text_height(translated_text, font_size, box_w - 20)
+        if needed_height > box_h:
+            # Expand box height to fit translation
+            box_h = needed_height + 20
+            # Ensure we don't go off-screen
+            if y + box_h > video_height:
+                y = max(5, video_height - box_h - 5)
+
+        # Escape text for ffmpeg (single quotes, backslashes, colons)
+        escaped_text = (
+            translated_text
+            .replace("\\", "\\\\\\\\")
+            .replace("'", "\u2019")  # curly apostrophe (avoids ffmpeg escaping hell)
+            .replace(":", "\\:")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+            .replace("%", "%%")
+        )
+
+        enable = f"enable='between(t,{appears_at:.2f},{disappears_at:.2f})'"
+
+        if font_style in ("rounded_background", "box_background", "caption_box"):
+            # STRATEGY: Draw opaque box covering original overlay, then text inside
+            # The box covers the original Russian text + background completely
+            box_color = "black@0.85"
+            text_color = "white"
+
+            # Draw background box
+            filters.append(
+                f"drawbox=x={x}:y={y}:w={box_w}:h={box_h}"
+                f":color={box_color}:t=fill:{enable}"
+            )
+
+            # Draw translated text centered in box
+            text_x = x + 10  # small left padding
+            text_y = y + 10  # small top padding
+            text_max_w = box_w - 20  # leave padding on both sides
+
+            font_arg = f":fontfile={font_path}" if font_path else ""
+            filters.append(
+                f"drawtext=text='{escaped_text}'"
+                f":x={text_x}:y={text_y}"
+                f":fontsize={font_size}"
+                f":fontcolor={text_color}"
+                f":borderw=2:bordercolor=black@0.6"
+                f"{font_arg}"
+                f":{enable}"
+            )
+        else:
+            # STRATEGY: Text only (inpaint should have removed original)
+            # Draw text with strong border for readability
+            text_x = x + 5
+            text_y = y + 5
+            font_arg = f":fontfile={font_path}" if font_path else ""
+            filters.append(
+                f"drawtext=text='{escaped_text}'"
+                f":x={text_x}:y={text_y}"
+                f":fontsize={font_size}"
+                f":fontcolor=white"
+                f":borderw=3:bordercolor=black"
+                f":shadowx=2:shadowy=2:shadowcolor=black@0.7"
+                f"{font_arg}"
+                f":{enable}"
+            )
+
+    if not filters:
+        logger.info("No valid overlay filters generated, skipping render")
+        return video_path
+
+    # Join all filters and run ffmpeg
+    filter_chain = ",".join(filters)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vf", filter_chain,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "copy",
+        output_path,
+    ]
+
+    logger.info(f"RENDER_TEXT: Running ffmpeg with {len(filters)} filter(s)")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+    if result.returncode != 0:
+        logger.error(f"RENDER_TEXT ffmpeg failed (rc={result.returncode}): {result.stderr[-500:]}")
+        # Non-critical — return original video
+        return video_path
+
+    if not os.path.exists(output_path):
+        logger.error("RENDER_TEXT: output file not created")
+        return video_path
+
+    logger.info(f"RENDER_TEXT: Successfully rendered {len(filters)} overlay filter(s)")
+    return output_path
+
+
 def stage_transcribe(video_path: str, vocals_path: str, mm: ModelManager) -> Dict:
     """Transcribe using Faster-Whisper with word timestamps."""
     logger.info("Stage: TRANSCRIBE (Faster-Whisper)")
@@ -1333,6 +1589,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             stages=job_input.get("stages"),
             callback_url=job_input.get("callback_url"),
             translated_text=job_input.get("translated_text"),  # Pre-translated from server
+            translated_overlays=job_input.get("translated_overlays"),  # Pre-translated text overlays
+            subtitle_style=job_input.get("subtitle_style"),  # Original subtitle style from manifest
         )
 
         mm = get_model_manager()
@@ -1393,6 +1651,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 elif stage_name == "detect_text":
                     result = stage_detect_text(state["video_path"], mm)
                     state["text_detections"] = result["detections"]
+                    state["text_resolution"] = result["resolution"]  # (width, height)
+                    state["text_fps"] = result["fps"]
 
                 elif stage_name == "create_mask":
                     state["mask_path"] = stage_create_mask(
@@ -1407,6 +1667,19 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         state["mask_path"],
                         mm
                     )
+
+                elif stage_name == "render_text":
+                    if config.translated_overlays:
+                        state["video_path"] = stage_render_text(
+                            state["video_path"],
+                            config.translated_overlays,
+                            state.get("text_detections", []),
+                            state.get("text_resolution", (1920, 1080)),
+                            state.get("text_fps", 30.0),
+                            config.subtitle_style,
+                        )
+                    else:
+                        logger.info("RENDER_TEXT: No translated overlays provided, skipping")
 
                 elif stage_name == "transcribe":
                     state["transcript"] = stage_transcribe(
