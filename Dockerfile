@@ -62,7 +62,7 @@ from paddleocr import PaddleOCR; print('paddleocr OK'); \
 from faster_whisper import WhisperModel; print('faster-whisper OK'); \
 import decord; print('decord OK'); \
 from sam2.sam2_video_predictor import SAM2VideoPredictor; print('sam2 OK'); \
-import demucs.api; print('demucs OK'); \
+from demucs_infer.pretrained import get_model; print('demucs-infer OK'); \
 import kornia; print('kornia OK'); \
 from peft import PeftModel; print('peft OK'); \
 import pyiqa; print('pyiqa OK'); \

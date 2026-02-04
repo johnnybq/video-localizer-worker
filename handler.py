@@ -274,11 +274,11 @@ class ModelManager:
             )
 
         elif name == "demucs":
-            import demucs.api
-            return demucs.api.Separator(
-                model="htdemucs_ft",
-                device=self.device
-            )
+            from demucs_infer.pretrained import get_model
+            model = get_model("htdemucs_ft")
+            model.eval()
+            model.to(self.device)
+            return model
 
         elif name == "f5tts":
             # F5-TTS loading
@@ -370,7 +370,7 @@ def stage_preprocess(video_path: str, mm: ModelManager) -> Dict:
     """
     logger.info("Stage: PREPROCESS (audio separation)")
 
-    demucs = mm.load("demucs")
+    demucs_model = mm.load("demucs")
 
     # Extract audio
     audio_path = video_path.replace(".mp4", "_audio.wav")
@@ -380,21 +380,30 @@ def stage_preprocess(video_path: str, mm: ModelManager) -> Dict:
         audio_path
     ], capture_output=True)
 
-    # Separate with Demucs
-    origin, separated = demucs.separate_audio_file(audio_path)
+    # Separate with demucs-infer
+    import torchaudio
+    from demucs_infer.apply import apply_model
+
+    wav, sr = torchaudio.load(audio_path)
+    wav = wav.unsqueeze(0)  # (1, channels, samples)
+
+    with torch.no_grad():
+        sources = apply_model(demucs_model, wav, device=mm.device)
+    # sources shape: (1, num_sources, channels, samples)
+    # htdemucs_ft sources: drums, bass, other, vocals (index order from model.sources)
+    source_names = demucs_model.sources  # e.g. ['drums', 'bass', 'other', 'vocals']
+    separated = {name: sources[0, i] for i, name in enumerate(source_names)}
 
     # Save separated tracks
     vocals_path = video_path.replace(".mp4", "_vocals.wav")
     background_path = video_path.replace(".mp4", "_background.wav")
 
     # Vocals = voice track
-    # Background = drums + bass + other (everything except vocals)
-    import torchaudio
-    torchaudio.save(vocals_path, separated["vocals"], 44100)
+    torchaudio.save(vocals_path, separated["vocals"].cpu(), sr)
 
-    # Mix background tracks
+    # Background = drums + bass + other (everything except vocals)
     background = separated["drums"] + separated["bass"] + separated["other"]
-    torchaudio.save(background_path, background, 44100)
+    torchaudio.save(background_path, background.cpu(), sr)
 
     return {
         "audio_path": audio_path,
