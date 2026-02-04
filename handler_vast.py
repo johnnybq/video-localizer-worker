@@ -1,287 +1,235 @@
 """
-TrafficPlant Video Localizer - Vast.ai PyWorker Handler
-=========================================================
-Implements Vast.ai PyWorker EndpointHandler for serverless video localization.
+TrafficPlant Video Localizer - Pull-Based Worker
+=================================================
+GPU worker that polls the backend for tasks instead of listening on a port.
+
+Architecture:
+  1. Worker starts on Vast.ai GPU instance
+  2. Polls POST /api/sota/worker/poll for pending tasks
+  3. Processes task using handler.py ML pipeline
+  4. Reports result via POST /api/sota/worker/result
+  5. Repeats until no tasks for IDLE_SHUTDOWN_SECS
+
+No inbound port required — all connections are outbound from worker.
 """
 
 import os
 import sys
 import time
-import json
 import uuid
 import logging
-import dataclasses
-from typing import Dict, Any, Optional, Type, Union
+import traceback
+from typing import Dict, Any
 
-from aiohttp import web, ClientResponse
+import requests
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s[%(levelname)-5s] %(message)s",
+    format="%(asctime)s [%(levelname)-5s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-
 # =============================================================================
-# Data Types
-# =============================================================================
-
-@dataclasses.dataclass
-class LocalizationPayload:
-    """Input payload for video localization."""
-    video_url: str
-    source_language: str = "auto"
-    target_language: str = "en"
-    voice_clone: bool = True
-    lipsync: bool = True
-    lipsync_quality: str = "high"
-    upscale: bool = False
-    face_enhance: bool = True
-    quality_threshold: float = 0.6
-    stages: Optional[list] = None
-    callback_url: Optional[str] = None
-
-    # Inpainting model: "videopainter" (default, better quality) or "propainter" (faster)
-    inpaint_model: str = "videopainter"
-
-    # Pre-translated text (simple string)
-    translated_text: Optional[str] = None
-
-    # Full translation data from API (Gemini 3 Pro VideoAnalyzer)
-    # If provided, skips transcribe AND translate stages
-    # Format:
-    # {
-    #   "transcript": [{"start": 0.0, "end": 2.5, "text": "..."}],
-    #   "text_overlays": [{"text": "...", "translated": "...", "appears_at_seconds": 2.5, ...}],
-    #   "voice_script": [{"text": "...", "emotion": "energetic"}],
-    #   "subtitle_style": {"font_family": "Montserrat", "text_color": "#FFFFFF", ...}
-    # }
-    translation_data: Optional[Dict[str, Any]] = None
-
-    @classmethod
-    def for_test(cls) -> "LocalizationPayload":
-        """Create a test payload for benchmarking."""
-        return cls(
-            video_url="https://pub-c025ef96f40e47aab26156a1874f64bc.r2.dev/test/sample.mp4",
-            stages=["detect_text", "transcribe"]
-        )
-
-
-# =============================================================================
-# Try to import PyWorker (Vast.ai SDK)
+# Configuration
 # =============================================================================
 
-try:
-    from lib.backend import Backend, LogAction
-    from lib.data_types import EndpointHandler, JsonDataException
-    from lib.server import start_server
-    PYWORKER_AVAILABLE = True
-except ImportError:
-    log.warning("PyWorker not available, using standalone mode")
-    PYWORKER_AVAILABLE = False
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://147.45.170.61:8081")
+POLL_URL = f"{BACKEND_URL}/api/sota/worker/poll"
+RESULT_URL = f"{BACKEND_URL}/api/sota/worker/result"
+PROGRESS_URL = f"{BACKEND_URL}/api/sota/worker/progress"
 
-    # Stub classes for standalone mode
-    class EndpointHandler:
-        pass
-
-    class JsonDataException(Exception):
-        pass
-
+WORKER_ID = os.environ.get("WORKER_ID", f"vast-{uuid.uuid4().hex[:8]}")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))         # seconds between polls
+IDLE_SHUTDOWN_SECS = int(os.environ.get("IDLE_SHUTDOWN", "600"))  # shutdown after N idle seconds
 
 # =============================================================================
 # Import Handler Logic
 # =============================================================================
 
-from handler import handler as run_localization, get_model_manager
+from handler import handler as run_localization, get_model_manager, set_progress_callback
 
 
 # =============================================================================
-# PyWorker Endpoint Handler
+# GPU Info
 # =============================================================================
 
-if PYWORKER_AVAILABLE:
-
-    @dataclasses.dataclass
-    class LocalizationHandler(EndpointHandler[LocalizationPayload]):
-        """PyWorker handler for video localization endpoint."""
-
-        benchmark_runs: int = 1
-        benchmark_words: int = 100
-
-        @property
-        def endpoint(self) -> str:
-            return "/localize"
-
-        @property
-        def healthcheck_endpoint(self) -> Optional[str]:
-            return "http://0.0.0.0:8080/health"
-
-        @classmethod
-        def payload_cls(cls) -> Type[LocalizationPayload]:
-            return LocalizationPayload
-
-        def generate_payload_json(self, payload: LocalizationPayload) -> Dict[str, Any]:
-            """Convert payload to JSON for model API."""
-            return dataclasses.asdict(payload)
-
-        def make_benchmark_payload(self) -> LocalizationPayload:
-            """Create payload for performance benchmarking."""
-            return LocalizationPayload.for_test()
-
-        async def generate_client_response(
-            self, client_request: web.Request, model_response: ClientResponse
-        ) -> Union[web.Response, web.StreamResponse]:
-            """Handle response from model server."""
-            if model_response.status == 200:
-                data = await model_response.json()
-                return web.json_response(data=data)
-            else:
-                error_text = await model_response.text()
-                return web.json_response(
-                    {"error": error_text},
-                    status=model_response.status
-                )
-
-
-# =============================================================================
-# Standalone HTTP Server (when PyWorker not available)
-# =============================================================================
-
-async def handle_health(request: web.Request) -> web.Response:
-    """Health check endpoint."""
-    import torch
-    return web.json_response({
-        "status": "healthy",
-        "gpu": torch.cuda.is_available(),
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-    })
-
-
-async def handle_localize(request: web.Request) -> web.Response:
-    """Handle localization request."""
+def get_gpu_name() -> str:
+    """Get GPU model name (for worker identification)."""
     try:
-        data = await request.json()
-        payload = LocalizationPayload(**data)
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return "unknown"
+
+
+# =============================================================================
+# Poll → Process → Report loop
+# =============================================================================
+
+def poll_for_task() -> Dict[str, Any]:
+    """
+    Poll backend for a pending GPU task.
+
+    Returns:
+        {"status": "task", "task_id": ..., "payload": {...}} or
+        {"status": "idle"}
+    """
+    try:
+        resp = requests.post(
+            POLL_URL,
+            json={"worker_id": WORKER_ID, "gpu_name": get_gpu_name()},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.ConnectionError as e:
+        log.warning(f"Poll connection error: {e}")
+        return {"status": "error", "error": str(e)}
     except Exception as e:
-        return web.json_response({"error": f"Invalid request: {e}"}, status=400)
+        log.error(f"Poll failed: {e}")
+        return {"status": "error", "error": str(e)}
 
-    job_id = str(uuid.uuid4())[:8]
 
-    # Run localization
+def report_progress(task_id: str, stage: str, elapsed: float, errors: list):
+    """Report per-stage progress to backend."""
+    try:
+        resp = requests.post(
+            PROGRESS_URL,
+            json={
+                "task_id": task_id,
+                "worker_id": WORKER_ID,
+                "stage": stage,
+                "elapsed": elapsed,
+                "errors": errors,
+            },
+            timeout=10,
+        )
+        log.info(f"Progress: task={task_id} stage={stage} elapsed={elapsed:.1f}s")
+    except Exception as e:
+        log.warning(f"Failed to report progress for {task_id}/{stage}: {e}")
+
+
+def report_result(task_id: str, status: str, result: dict):
+    """Report task result back to backend."""
+    try:
+        resp = requests.post(
+            RESULT_URL,
+            json={
+                "task_id": task_id,
+                "worker_id": WORKER_ID,
+                "status": status,
+                "result": result,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        log.info(f"Result reported: task={task_id} status={status} -> {data}")
+    except Exception as e:
+        log.error(f"Failed to report result for task {task_id}: {e}")
+
+
+def process_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process a single GPU task using the ML pipeline.
+
+    Args:
+        task: {"task_id": ..., "job_id": ..., "geo": ..., "payload": {...}}
+
+    Returns:
+        Result dict from handler.
+    """
+    task_id = task["task_id"]
+    payload = task["payload"]
+    geo = task.get("geo", "?")
+
+    log.info(f"{'=' * 60}")
+    log.info(f"Processing task {task_id} | geo={geo} | job={task.get('job_id')}")
+    log.info(f"  video: {payload.get('video_url', '?')[:80]}")
+    log.info(f"  target_language: {payload.get('target_language')}")
+    log.info(f"  voice_clone: {payload.get('voice_clone')}")
+    log.info(f"  lipsync: {payload.get('lipsync')}")
+    log.info(f"{'=' * 60}")
+
+    # Register per-stage progress callback for this task
+    def _on_stage(stage_name, elapsed_secs, errors):
+        report_progress(task_id, stage_name, elapsed_secs, [str(e) for e in errors])
+
+    set_progress_callback(_on_stage)
+
+    # Build job_input in the format handler() expects
     job_input = {
-        "id": job_id,
-        "input": dataclasses.asdict(payload)
+        "id": task_id,
+        "input": payload,
     }
 
-    try:
-        result = run_localization(job_input)
-        return web.json_response({"job_id": job_id, **result})
-    except Exception as e:
-        log.error(f"Localization failed: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+    start = time.time()
+    result = run_localization(job_input)
+    elapsed = time.time() - start
 
-
-def run_standalone_server():
-    """Run standalone HTTP server (no PyWorker)."""
-    log.info("Starting standalone HTTP server...")
-
-    app = web.Application()
-    app.router.add_get("/health", handle_health)
-    app.router.add_post("/localize", handle_localize)
-    app.router.add_get("/ping", lambda _: web.Response(text="pong"))
-
-    port = int(os.environ.get("PORT", "8080"))
-    web.run_app(app, host="0.0.0.0", port=port)
+    log.info(f"Task {task_id} finished in {elapsed:.1f}s — status: {result.get('status')}")
+    return result
 
 
 # =============================================================================
-# Model Server (for PyWorker backend)
+# Main Loop
 # =============================================================================
 
-async def model_server_handler(request: web.Request) -> web.Response:
-    """Internal model server that processes localization requests."""
-    try:
-        data = await request.json()
+def main():
+    log.info(f"{'=' * 60}")
+    log.info(f"TrafficPlant GPU Worker (Pull-Based)")
+    log.info(f"  worker_id:    {WORKER_ID}")
+    log.info(f"  backend:      {BACKEND_URL}")
+    log.info(f"  poll_interval: {POLL_INTERVAL}s")
+    log.info(f"  idle_shutdown: {IDLE_SHUTDOWN_SECS}s")
+    log.info(f"  gpu:          {get_gpu_name()}")
+    log.info(f"{'=' * 60}")
 
-        job_id = str(uuid.uuid4())[:8]
-        job_input = {"id": job_id, "input": data}
+    idle_since = time.time()
+    tasks_completed = 0
 
-        result = run_localization(job_input)
-        return web.json_response({"job_id": job_id, **result})
+    while True:
+        poll_result = poll_for_task()
 
-    except Exception as e:
-        log.error(f"Model server error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        if poll_result.get("status") == "task":
+            # Reset idle timer
+            idle_since = time.time()
 
+            task_id = poll_result["task_id"]
+            try:
+                result = process_task(poll_result)
+                status = "success" if result.get("status") == "success" else "error"
+                report_result(task_id, status, result)
+                tasks_completed += 1
+            except Exception as e:
+                log.error(f"Task {task_id} crashed: {e}")
+                log.error(traceback.format_exc())
+                report_result(task_id, "error", {"error": str(e), "traceback": traceback.format_exc()})
 
-async def model_health_handler(request: web.Request) -> web.Response:
-    """Model server health check."""
-    import torch
-    return web.json_response({
-        "status": "ok",
-        "gpu": torch.cuda.is_available()
-    })
+            # Immediately poll again (might be more tasks)
+            continue
 
+        elif poll_result.get("status") == "idle":
+            idle_elapsed = time.time() - idle_since
+            if idle_elapsed > IDLE_SHUTDOWN_SECS:
+                log.info(
+                    f"No tasks for {IDLE_SHUTDOWN_SECS}s — shutting down. "
+                    f"Completed {tasks_completed} task(s) this session."
+                )
+                break
 
-def run_model_server():
-    """Run internal model server (port 8080)."""
-    log.info("Starting model server on port 8080...")
+        elif poll_result.get("status") == "error":
+            # Backend unreachable — back off longer
+            log.warning(f"Backend unreachable, waiting {POLL_INTERVAL * 3}s...")
+            time.sleep(POLL_INTERVAL * 3)
+            continue
 
-    app = web.Application()
-    app.router.add_post("/localize", model_server_handler)
-    app.router.add_get("/health", model_health_handler)
+        time.sleep(POLL_INTERVAL)
 
-    web.run_app(app, host="0.0.0.0", port=8080)
-
-
-# =============================================================================
-# PyWorker Backend Setup
-# =============================================================================
-
-def run_pyworker_server():
-    """Run PyWorker backend server."""
-    log.info("Starting PyWorker backend...")
-
-    backend = Backend(
-        model_server_url="http://0.0.0.0:8080",
-        model_log_file=os.environ.get("MODEL_LOG", "/var/log/model.log"),
-        allow_parallel_requests=False,  # GPU can only handle one at a time
-        benchmark_handler=LocalizationHandler(benchmark_runs=1),
-        log_actions=[
-            (LogAction.ModelLoaded, "Video Localizer ready"),
-            (LogAction.ModelError, "Localizer error"),
-            (LogAction.Info, "Processing video"),
-        ]
-    )
-
-    routes = [
-        web.post("/localize", backend.create_handler(LocalizationHandler())),
-        web.get("/health", lambda _: web.Response(text="ok")),
-        web.get("/ping", lambda _: web.Response(text="pong")),
-    ]
-
-    start_server(backend, routes)
-
-
-# =============================================================================
-# Main Entry Point
-# =============================================================================
 
 if __name__ == "__main__":
-    import multiprocessing
-
-    mode = os.environ.get("VAST_MODE", "standalone")
-
-    if mode == "pyworker" and PYWORKER_AVAILABLE:
-        # Run both model server and PyWorker backend
-        model_proc = multiprocessing.Process(target=run_model_server)
-        model_proc.start()
-
-        time.sleep(5)  # Wait for model server to start
-
-        run_pyworker_server()
-    else:
-        # Standalone mode - simple HTTP server
-        run_standalone_server()
+    main()

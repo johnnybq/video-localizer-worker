@@ -47,6 +47,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Optional progress callback: called after each pipeline stage completes.
+# Signature: callback(stage_name: str, elapsed_secs: float, errors: list)
+# Set by handler_vast.py for per-stage reporting to backend.
+_progress_callback = None
+
+
+def set_progress_callback(fn):
+    """Register a progress callback for per-stage reporting."""
+    global _progress_callback
+    _progress_callback = fn
+
 
 # =============================================================================
 # Configuration
@@ -1353,6 +1364,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
             metrics.stage_times[stage_name] = time.time() - t0
             logger.info(f"Stage {stage_name} completed in {metrics.stage_times[stage_name]:.1f}s")
+
+            # Fire progress callback if registered
+            if _progress_callback:
+                try:
+                    _progress_callback(stage_name, metrics.stage_times[stage_name], metrics.errors)
+                except Exception:
+                    pass  # Never let callback failures break the pipeline
 
         # Upload result to R2
         try:
