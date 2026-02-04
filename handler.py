@@ -100,6 +100,65 @@ class PipelineStage(Enum):
 CRITICAL_STAGES = {"transcribe", "translate", "tts", "assemble"}
 
 
+def diagnose_videopainter() -> Dict[str, Any]:
+    """
+    Diagnose VideoPainter dependencies at startup.
+    Returns dict with status of each component.
+    """
+    results = {
+        "videopainter_root": False,
+        "videopainter_checkpoints": False,
+        "cogvideox_model": False,
+        "custom_diffusers_pipeline": False,
+        "errors": []
+    }
+
+    # Check VIDEOPAINTER_ROOT
+    vp_root = os.environ.get("VIDEOPAINTER_ROOT", "/opt/videopainter")
+    if os.path.exists(vp_root):
+        results["videopainter_root"] = True
+        logger.info(f"✓ VIDEOPAINTER_ROOT exists: {vp_root}")
+    else:
+        results["errors"].append(f"VIDEOPAINTER_ROOT not found: {vp_root}")
+        logger.warning(f"✗ VIDEOPAINTER_ROOT not found: {vp_root}")
+
+    # Check checkpoints
+    vp_ckpt = os.environ.get("VIDEOPAINTER_CKPT", "/workspace/models/videopainter/checkpoints")
+    if os.path.exists(vp_ckpt):
+        results["videopainter_checkpoints"] = True
+        logger.info(f"✓ VIDEOPAINTER_CKPT exists: {vp_ckpt}")
+    else:
+        results["errors"].append(f"VIDEOPAINTER_CKPT not found: {vp_ckpt}")
+        logger.warning(f"✗ VIDEOPAINTER_CKPT not found: {vp_ckpt}")
+
+    # Check CogVideoX model (may need to download)
+    hf_home = os.environ.get("HF_HOME", "/workspace/models/huggingface")
+    cogvideo_path = os.path.join(hf_home, "THUDM/CogVideoX-5b-I2V")
+    hub_path = os.path.join(hf_home, "hub", "models--THUDM--CogVideoX-5b-I2V")
+    if os.path.exists(cogvideo_path) or os.path.exists(hub_path):
+        results["cogvideox_model"] = True
+        logger.info(f"✓ CogVideoX-5b-I2V model cached")
+    else:
+        results["errors"].append("CogVideoX-5b-I2V not cached (will download on first use, ~20GB)")
+        logger.warning(f"✗ CogVideoX-5b-I2V not cached - will need to download (~20GB)")
+
+    # Check custom diffusers pipeline import
+    try:
+        if results["videopainter_root"]:
+            import sys
+            sys.path.insert(0, vp_root)
+        from diffusers.pipelines.cogvideo.pipeline_cogvideox_i2v_dual_inpaint_anyl import (
+            CogVideoXI2VDualInpaintAnyLPipeline,
+        )
+        results["custom_diffusers_pipeline"] = True
+        logger.info("✓ Custom diffusers pipeline (CogVideoXI2VDualInpaintAnyLPipeline) available")
+    except ImportError as e:
+        results["errors"].append(f"Custom diffusers pipeline import failed: {e}")
+        logger.warning(f"✗ Custom diffusers pipeline import failed: {e}")
+
+    return results
+
+
 @dataclass
 class JobConfig:
     """Configuration for a localization job."""
@@ -590,8 +649,13 @@ def _render_mask_video(video_path: str, masks: Dict[int, np.ndarray], output_pat
     out.release()
 
 
-def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager) -> str:
-    """Remove text using VideoPainter (primary) or ProPainter (fallback)."""
+def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Optional[List[str]] = None) -> str:
+    """
+    Remove text using VideoPainter (primary) or ProPainter (fallback).
+
+    Args:
+        errors: Optional list to append error messages (for metrics tracking)
+    """
     logger.info("Stage: INPAINT")
 
     if mask_path is None:
@@ -599,21 +663,43 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager) -> str:
         return video_path
 
     output_path = video_path.replace(".mp4", "_inpainted.mp4")
+    all_errors = []
 
     # Try VideoPainter first (best quality, CogVideoX-based)
     try:
+        logger.info("INPAINT: Attempting VideoPainter (CogVideoX-based)...")
         with mm.use("videopainter") as videopainter:
-            return _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
+            result = _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
+            logger.info("INPAINT: VideoPainter succeeded!")
+            return result
     except Exception as e:
-        logger.warning(f"VideoPainter failed: {e}, trying ProPainter")
+        import traceback
+        err_msg = f"VideoPainter failed: {e}"
+        logger.warning(err_msg)
+        logger.debug(f"VideoPainter traceback:\n{traceback.format_exc()}")
+        all_errors.append(err_msg)
 
     # Fallback to ProPainter
     try:
-        return _inpaint_propainter(video_path, mask_path, output_path)
+        logger.info("INPAINT: Attempting ProPainter fallback...")
+        result = _inpaint_propainter(video_path, mask_path, output_path)
+        logger.info("INPAINT: ProPainter succeeded!")
+        return result
     except Exception as e:
-        logger.error(f"ProPainter also failed: {e}")
-        # Return original as last resort
-        return video_path
+        import traceback
+        err_msg = f"ProPainter failed: {e}"
+        logger.error(err_msg)
+        logger.debug(f"ProPainter traceback:\n{traceback.format_exc()}")
+        all_errors.append(err_msg)
+
+    # All methods failed - log to errors array
+    combined_error = f"inpaint: ALL methods failed - {'; '.join(all_errors)}"
+    logger.error(combined_error)
+    if errors is not None:
+        errors.append(combined_error)
+
+    # Return original as last resort
+    return video_path
 
 
 def _inpaint_propainter(video_path: str, mask_path: str, output_path: str) -> str:
@@ -839,25 +925,55 @@ def _find_overlay_bbox(
     """
     Find pixel bounding box for an overlay by matching against OCR detections.
 
+    Strategy:
+    1. Filter OCR detections by position (top half / bottom half based on overlay.position)
+    2. Try fuzzy-matching overlay text against filtered detections
+    3. If matches found, union all matched bboxes with generous padding
+    4. Fallback: use position hints with dynamic sizing based on text length
+
     Returns (x, y, w, h) in pixels.
-    Falls back to position hints (top/bottom/center) if no OCR match.
     """
     from difflib import SequenceMatcher
 
     original_text = overlay.get("text", "")
-    best_match_score = 0.0
+    position = overlay.get("position", "top")
     matched_bboxes = []
 
-    # Try fuzzy-matching overlay text against OCR detections
-    for det in text_detections:
+    # First, filter detections by vertical region based on position hint
+    if position == "top":
+        region_detections = [d for d in text_detections if d.get("bbox_norm", [0, 0, 0, 0])[1] < 0.5]
+    elif position == "bottom":
+        region_detections = [d for d in text_detections if d.get("bbox_norm", [0, 0, 0, 0])[1] > 0.4]
+    else:
+        region_detections = text_detections
+
+    # Try fuzzy-matching overlay text against region detections
+    for det in region_detections:
         det_text = det.get("text", "")
+        if not det_text or len(det_text) < 2:
+            continue
+
         # Check if detection text is a substring or fuzzy match
         score = SequenceMatcher(None, original_text.lower(), det_text.lower()).ratio()
+
         # Also check if det_text is contained in overlay text (OCR splits lines)
-        if det_text.lower() in original_text.lower() and len(det_text) > 3:
-            score = max(score, 0.7)
-        if score > 0.3:
+        if det_text.lower() in original_text.lower() and len(det_text) > 2:
+            score = max(score, 0.6)
+
+        # Check for word overlap
+        det_words = set(det_text.lower().split())
+        overlay_words = set(original_text.lower().split())
+        if det_words & overlay_words:  # Any common words
+            score = max(score, 0.5)
+
+        if score > 0.25:  # Lower threshold to catch partial matches
             matched_bboxes.append(det["bbox_norm"])
+
+    # If no text matches but we have detections in the region, use ALL of them
+    # (better to cover more than miss the original text)
+    if not matched_bboxes and region_detections:
+        logger.info(f"RENDER_TEXT: No text match for '{original_text[:30]}...', using all {len(region_detections)} detections in {position} region")
+        matched_bboxes = [d["bbox_norm"] for d in region_detections]
 
     if matched_bboxes:
         # Union all matched bboxes into one region
@@ -866,9 +982,10 @@ def _find_overlay_bbox(
         x_max = max(b[2] for b in matched_bboxes)
         y_max = max(b[3] for b in matched_bboxes)
 
-        # Add padding (15% on each side) to cover the original background box
-        pad_x = (x_max - x_min) * 0.15
-        pad_y = (y_max - y_min) * 0.20
+        # Add GENEROUS padding to fully cover the original background box
+        # The original might have rounded corners, shadows, etc.
+        pad_x = (x_max - x_min) * 0.25
+        pad_y = (y_max - y_min) * 0.35
         x_min = max(0, x_min - pad_x)
         y_min = max(0, y_min - pad_y)
         x_max = min(1.0, x_max + pad_x)
@@ -878,23 +995,32 @@ def _find_overlay_bbox(
         y = int(y_min * video_height)
         w = int((x_max - x_min) * video_width)
         h = int((y_max - y_min) * video_height)
+
+        logger.info(f"RENDER_TEXT: Found bbox from {len(matched_bboxes)} OCR matches: ({x}, {y}, {w}x{h})")
         return (x, y, w, h)
 
-    # Fallback: use position hints from Gemini manifest
-    position = overlay.get("position", "top")
-    margin = int(video_width * 0.05)
-    box_w = int(video_width * 0.90)
-    box_h = int(video_height * 0.15)
+    # Fallback: use position hints from Gemini manifest with dynamic sizing
+    logger.warning(f"RENDER_TEXT: No OCR matches for '{original_text[:30]}...', using fallback position '{position}'")
+
+    translated_text = overlay.get("translated_text", original_text)
+    margin = int(video_width * 0.03)  # 3% margin
+    box_w = int(video_width * 0.94)   # 94% width for long text
+
+    # Estimate needed height based on translated text length
+    chars_per_line = max(1, box_w // 20)  # Rough estimate
+    num_lines = max(1, (len(translated_text) // chars_per_line) + 1)
+    box_h = max(int(video_height * 0.12), int(num_lines * 35 + 30))  # Min 12% height or calculated
+
     x = margin
 
     if position == "top":
-        y = int(video_height * 0.05)
+        y = int(video_height * 0.03)  # 3% from top
     elif position == "bottom":
-        y = int(video_height * 0.75)
+        y = int(video_height * 0.85) - box_h  # Position so bottom is at 85%
     elif position == "center":
-        y = int(video_height * 0.40)
+        y = int(video_height * 0.45) - (box_h // 2)
     else:
-        y = int(video_height * 0.05)
+        y = int(video_height * 0.03)
 
     return (x, y, box_w, box_h)
 
@@ -913,6 +1039,39 @@ def _estimate_text_height(text: str, font_size: int, box_width: int) -> int:
         else:
             current_line_len += len(word) + 1
     return int(lines * font_size * 1.3)  # 1.3 line spacing
+
+
+def _wrap_text_for_ffmpeg(text: str, max_chars_per_line: int) -> str:
+    """
+    Insert line breaks for ffmpeg drawtext.
+
+    ffmpeg doesn't support automatic word-wrap, so we manually insert
+    newlines at appropriate points. Uses \\n which ffmpeg interprets as newline.
+    """
+    if max_chars_per_line <= 0:
+        max_chars_per_line = 40
+
+    words = text.split()
+    lines = []
+    current_line = []
+    current_len = 0
+
+    for word in words:
+        word_len = len(word)
+        # If adding this word exceeds limit and we have content, start new line
+        if current_len + word_len + 1 > max_chars_per_line and current_line:
+            lines.append(" ".join(current_line))
+            current_line = [word]
+            current_len = word_len
+        else:
+            current_line.append(word)
+            current_len += word_len + (1 if current_len > 0 else 0)
+
+    if current_line:
+        lines.append(" ".join(current_line))
+
+    # ffmpeg uses \n for newlines in drawtext, but we need to escape it
+    return "\\n".join(lines)
 
 
 def stage_render_text(
@@ -978,21 +1137,33 @@ def stage_render_text(
 
         # Calculate font size to fit text in box
         # Start with size based on box height, then check if text fits width
-        font_size = min(40, max(16, int(box_h * 0.18)))
+        font_size = min(36, max(18, int(box_h * 0.22)))
 
-        # Check if translated text fits — if not, reduce font size or expand box
-        needed_height = _estimate_text_height(translated_text, font_size, box_w - 20)
+        # Calculate characters per line for word-wrapping
+        # Estimate ~0.55 * font_size per character width
+        text_padding = 20  # padding inside box
+        usable_width = box_w - text_padding * 2
+        chars_per_line = max(15, int(usable_width / (font_size * 0.55)))
+
+        # Word-wrap the translated text BEFORE escaping
+        wrapped_text = _wrap_text_for_ffmpeg(translated_text, chars_per_line)
+        num_lines = wrapped_text.count("\\n") + 1
+
+        # Recalculate needed height based on wrapped text
+        line_height = int(font_size * 1.3)
+        needed_height = num_lines * line_height + text_padding * 2
+
         if needed_height > box_h:
             # Expand box height to fit translation
-            box_h = needed_height + 20
+            box_h = needed_height
             # Ensure we don't go off-screen
             if y + box_h > video_height:
                 y = max(5, video_height - box_h - 5)
 
         # Escape text for ffmpeg (single quotes, backslashes, colons)
+        # Note: wrapped_text already has \\n for newlines
         escaped_text = (
-            translated_text
-            .replace("\\", "\\\\\\\\")
+            wrapped_text
             .replace("'", "\u2019")  # curly apostrophe (avoids ffmpeg escaping hell)
             .replace(":", "\\:")
             .replace("[", "\\[")
@@ -1000,13 +1171,33 @@ def stage_render_text(
             .replace("%", "%%")
         )
 
+        logger.info(f"RENDER_TEXT overlay {i}: {len(translated_text)} chars → {num_lines} lines, font={font_size}, box=({x},{y},{box_w}x{box_h})")
+
         enable = f"enable='between(t,{appears_at:.2f},{disappears_at:.2f})'"
 
-        if font_style in ("rounded_background", "box_background", "caption_box"):
+        # Check if this style requires a background box
+        # Gemini may return various font_style values like "rounded_sans_background",
+        # "rounded_background", "box_background", etc.
+        has_background = (
+            "background" in font_style.lower() or
+            "box" in font_style.lower() or
+            "caption" in font_style.lower()
+        )
+
+        if has_background:
             # STRATEGY: Draw opaque box covering original overlay, then text inside
             # The box covers the original Russian text + background completely
-            box_color = "black@0.85"
-            text_color = "white"
+            # Use subtitle_style colors if available, else defaults
+            if subtitle_style:
+                bg_hex = subtitle_style.get("background_color", "#000000")
+                bg_opacity = subtitle_style.get("background_opacity", 0.85)
+                text_hex = subtitle_style.get("text_color", "#FFFFFF")
+                # Convert hex to ffmpeg format (0xRRGGBB)
+                box_color = f"{bg_hex.replace('#', '0x')}@{bg_opacity}"
+                text_color = text_hex.replace("#", "0x")
+            else:
+                box_color = "black@0.85"
+                text_color = "white"
 
             # Draw background box
             filters.append(
@@ -1665,7 +1856,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     state["video_path"] = stage_inpaint(
                         state["video_path"],
                         state["mask_path"],
-                        mm
+                        mm,
+                        errors=metrics.errors  # Track inpaint failures
                     )
 
                 elif stage_name == "render_text":
@@ -1825,6 +2017,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # RunPod entry point
+# Run VideoPainter diagnostics on module load
+_videopainter_diag = None
+try:
+    _videopainter_diag = diagnose_videopainter()
+    if _videopainter_diag["errors"]:
+        logger.warning(f"VideoPainter diagnostics: {len(_videopainter_diag['errors'])} issues found")
+    else:
+        logger.info("VideoPainter diagnostics: All components OK")
+except Exception as e:
+    logger.error(f"VideoPainter diagnostics failed: {e}")
+
+
 if __name__ == "__main__":
     import runpod
     runpod.serverless.start({"handler": handler})
