@@ -782,15 +782,92 @@ def stage_translate(text: str, source_lang: str, target_lang: str) -> str:
     return translated
 
 
-def stage_tts(text: str, reference_audio: str, mm: ModelManager) -> str:
-    """Generate speech using F5-TTS with voice cloning."""
-    logger.info("Stage: TTS (F5-TTS)")
+def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en") -> Optional[str]:
+    """Generate speech using ElevenLabs API (best quality, runs from GPU worker IP to avoid geo-blocks)."""
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        logger.info("ElevenLabs: no API key, skipping")
+        return None
+
+    import httpx
+
+    output_path = tempfile.mktemp(suffix=".mp3")
+
+    try:
+        # Step 1: Create voice clone from reference audio
+        logger.info("ElevenLabs: cloning voice from reference audio...")
+        with open(reference_audio, "rb") as f:
+            clone_resp = httpx.post(
+                "https://api.elevenlabs.io/v1/voices/add",
+                headers={"xi-api-key": api_key},
+                data={"name": "clone_temp", "description": "Temporary clone for localization"},
+                files={"files": ("reference.wav", f, "audio/wav")},
+                timeout=30,
+            )
+        if clone_resp.status_code != 200:
+            logger.warning(f"ElevenLabs clone failed: {clone_resp.status_code} {clone_resp.text[:200]}")
+            return None
+
+        voice_id = clone_resp.json().get("voice_id")
+        if not voice_id:
+            logger.warning("ElevenLabs: no voice_id returned")
+            return None
+
+        logger.info(f"ElevenLabs: voice cloned as {voice_id}")
+
+        # Step 2: Generate speech with cloned voice
+        try:
+            tts_resp = httpx.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                headers={
+                    "xi-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "text": text,
+                    "model_id": "eleven_turbo_v2_5",
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.85,
+                        "style": 0.3,
+                    },
+                },
+                timeout=60,
+            )
+            if tts_resp.status_code != 200:
+                logger.warning(f"ElevenLabs TTS failed: {tts_resp.status_code}")
+                return None
+
+            with open(output_path, "wb") as out:
+                out.write(tts_resp.content)
+
+            logger.info(f"ElevenLabs: generated {len(tts_resp.content)} bytes of audio")
+            return output_path
+
+        finally:
+            # Step 3: Delete temporary voice clone
+            try:
+                httpx.delete(
+                    f"https://api.elevenlabs.io/v1/voices/{voice_id}",
+                    headers={"xi-api-key": api_key},
+                    timeout=10,
+                )
+                logger.info(f"ElevenLabs: deleted temp voice {voice_id}")
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.warning(f"ElevenLabs failed: {e}")
+        return None
+
+
+def _tts_f5(text: str, reference_audio: str, mm: ModelManager) -> str:
+    """Generate speech using F5-TTS locally (fallback)."""
+    logger.info("TTS fallback: F5-TTS (local)")
 
     f5 = mm.load("f5tts")
-
     output_path = tempfile.mktemp(suffix=".wav")
 
-    # F5-TTS inference with voice cloning
     audio = f5.infer(
         ref_audio=reference_audio,
         ref_text="",  # Auto-transcribe reference
@@ -802,6 +879,19 @@ def stage_tts(text: str, reference_audio: str, mm: ModelManager) -> str:
     torchaudio.save(output_path, audio, 24000)
 
     return output_path
+
+
+def stage_tts(text: str, reference_audio: str, mm: ModelManager) -> str:
+    """Generate speech: ElevenLabs API (primary) → F5-TTS local (fallback)."""
+    logger.info("Stage: TTS")
+
+    # Primary: ElevenLabs (runs from US GPU IP — no geo-block)
+    result = _tts_elevenlabs(text, reference_audio)
+    if result:
+        return result
+
+    # Fallback: F5-TTS on local GPU
+    return _tts_f5(text, reference_audio, mm)
 
 
 def stage_lipsync(video_path: str, audio_path: str, quality: str, mm: ModelManager) -> str:
