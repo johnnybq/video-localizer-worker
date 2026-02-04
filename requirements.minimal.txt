@@ -1,12 +1,9 @@
 # ==============================================================================
-# TrafficPlant Video Localizer - MINIMAL requirements
+# TrafficPlant Video Localizer - Full requirements
 # ==============================================================================
-# Heavy ML packages (torch, transformers, etc.) are in the base image
-# Models download to Network Volume on first run
+# Base image (vastai/pytorch) provides: torch, torchvision, torchaudio,
+# transformers, diffusers, accelerate, xformers
 # ==============================================================================
-
-# RunPod SDK
-runpod>=1.7.0
 
 # HTTP & Storage
 httpx>=0.27.0
@@ -19,15 +16,43 @@ ffmpeg-python>=0.2.0
 pydub>=0.25.1
 soundfile>=0.12.0
 
-# OCR (lightweight)
+# OCR
 paddlepaddle>=2.6.0
 paddleocr>=2.8.0,<3.0.0
+
+# Segmentation & Masking (for inpaint pipeline)
+sam2>=1.0
+
+# Inpainting — VideoPainter uses diffusers CogVideoX (in base image)
+# ProPainter fallback uses Replicate API (no local deps needed)
 
 # Transcription
 faster-whisper>=1.1.0
 
+# Audio Separation
+demucs>=4.0.0
+
+# Voice Cloning (TTS)
+f5-tts>=1.0.0
+
 # Translation (fallback - main translation on server via Gemini)
 argostranslate>=1.9.0
+
+# Face Enhancement
+gfpgan>=1.3.0
+basicsr>=1.4.0
+
+# Quality Assessment
+pyiqa>=0.1.10
+
+# Lipsync (optional — models loaded from /models/ paths)
+# video-retalking, musetalk, wav2lip are loaded from local paths
+
+# Upscale
+realesrgan>=0.3.0
+
+# Replicate API (fallback for ProPainter)
+replicate>=1.0.0
 
 # Utilities
 numpy>=1.26.0

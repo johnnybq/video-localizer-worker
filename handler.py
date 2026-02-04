@@ -518,7 +518,7 @@ def _render_mask_video(video_path: str, masks: Dict[int, np.ndarray], output_pat
 
 
 def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager) -> str:
-    """Remove text using ProPainter (fallback) or VideoPainter."""
+    """Remove text using VideoPainter (primary) or ProPainter (fallback)."""
     logger.info("Stage: INPAINT")
 
     if mask_path is None:
@@ -527,18 +527,18 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager) -> str:
 
     output_path = video_path.replace(".mp4", "_inpainted.mp4")
 
-    # Try ProPainter first (more reliable, simpler interface)
-    try:
-        return _inpaint_propainter(video_path, mask_path, output_path)
-    except Exception as e:
-        logger.warning(f"ProPainter failed: {e}, trying VideoPainter")
-
-    # Fallback to VideoPainter
+    # Try VideoPainter first (best quality, CogVideoX-based)
     try:
         with mm.use("videopainter") as videopainter:
             return _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
     except Exception as e:
-        logger.error(f"VideoPainter also failed: {e}")
+        logger.warning(f"VideoPainter failed: {e}, trying ProPainter")
+
+    # Fallback to ProPainter
+    try:
+        return _inpaint_propainter(video_path, mask_path, output_path)
+    except Exception as e:
+        logger.error(f"ProPainter also failed: {e}")
         # Return original as last resort
         return video_path
 
