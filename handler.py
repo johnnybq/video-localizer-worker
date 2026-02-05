@@ -925,39 +925,41 @@ def _find_overlay_bbox(
     """
     Find pixel bounding box for an overlay based on OCR detections.
 
-    AGGRESSIVE STRATEGY: Use position hint to filter, but if no detections found,
-    try the other half too. The goal is to ALWAYS use OCR coordinates if possible.
+    SOTA ASS Logic 2.0: Strict zone filtering
+    - top:    y_center < 0.45 (upper 45% of screen)
+    - bottom: y_center > 0.55 (lower 45% of screen)
+    - middle: 0.45 <= y_center <= 0.55
 
-    Returns (x, y, w, h) in pixels.
+    Returns (x, y, w, h) in pixels with generous padding.
     """
     position = overlay.get("position", "top")
     original_text = overlay.get("text", "")[:40]
 
     # Log all detections for debugging
     logger.info(f"RENDER_TEXT bbox: position='{position}', total_detections={len(text_detections)}")
-    for i, d in enumerate(text_detections[:5]):  # Log first 5
-        bbox = d.get("bbox_norm", [])
-        text = d.get("text", "")[:20]
-        logger.info(f"  det[{i}]: y={bbox[1]:.3f} text='{text}...'")
+    for i, d in enumerate(text_detections[:8]):  # Log first 8
+        bbox = d.get("bbox_norm", [0, 0, 1, 1])
+        y_center = (bbox[1] + bbox[3]) / 2
+        text = d.get("text", "")[:25]
+        logger.info(f"  det[{i}]: y_center={y_center:.3f} bbox=[{bbox[0]:.2f},{bbox[1]:.2f},{bbox[2]:.2f},{bbox[3]:.2f}] '{text}'")
 
-    # Split detections into top and bottom halves
-    top_detections = [d for d in text_detections
-                      if d.get("bbox_norm", [0, 1, 0, 1])[1] < 0.5]
-    bottom_detections = [d for d in text_detections
-                         if d.get("bbox_norm", [0, 0, 0, 0])[1] >= 0.5]
+    # STRICT zone filtering by y_center
+    filtered = []
+    for d in text_detections:
+        bbox = d.get("bbox_norm", [0, 0, 1, 1])
+        y_center = (bbox[1] + bbox[3]) / 2
 
-    logger.info(f"RENDER_TEXT: {len(top_detections)} top, {len(bottom_detections)} bottom detections")
+        if position == "top" and y_center < 0.45:
+            filtered.append(d)
+        elif position == "bottom" and y_center > 0.55:
+            filtered.append(d)
+        elif position in ("middle", "center") and 0.45 <= y_center <= 0.55:
+            filtered.append(d)
 
-    # Choose detections based on position, with fallback
-    if position == "top":
-        region_detections = top_detections if top_detections else bottom_detections
-    elif position == "bottom":
-        region_detections = bottom_detections if bottom_detections else top_detections
-    else:
-        region_detections = text_detections
+    logger.info(f"RENDER_TEXT: Filtered {len(filtered)} detections for zone '{position}'")
 
-    if region_detections:
-        bboxes = [d["bbox_norm"] for d in region_detections if "bbox_norm" in d]
+    if filtered:
+        bboxes = [d["bbox_norm"] for d in filtered if "bbox_norm" in d]
 
         if bboxes:
             x_min = min(b[0] for b in bboxes)
@@ -965,11 +967,11 @@ def _find_overlay_bbox(
             x_max = max(b[2] for b in bboxes)
             y_max = max(b[3] for b in bboxes)
 
-            logger.info(f"RENDER_TEXT: OCR raw bbox: x=[{x_min:.3f},{x_max:.3f}] y=[{y_min:.3f},{y_max:.3f}]")
+            logger.info(f"RENDER_TEXT: Zone '{position}' raw bbox: x=[{x_min:.3f},{x_max:.3f}] y=[{y_min:.3f},{y_max:.3f}]")
 
-            # GENEROUS padding - we want to FULLY cover the original text + background
-            pad_x = 0.03  # 3% horizontal padding
-            pad_y = 0.02  # 2% vertical padding
+            # GENEROUS padding to fully cover original text + background
+            pad_x = 0.02  # 2% horizontal
+            pad_y = 0.015  # 1.5% vertical
 
             x_min = max(0, x_min - pad_x)
             y_min = max(0, y_min - pad_y)
@@ -982,49 +984,43 @@ def _find_overlay_bbox(
             w = int((x_max - x_min) * video_width)
             h = int((y_max - y_min) * video_height)
 
-            # Ensure reasonable minimum dimensions
-            min_w = int(video_width * 0.7)  # At least 70% width
-            min_h = int(video_height * 0.08)  # At least 8% height
+            # Minimum dimensions for readability
+            min_w = int(video_width * 0.5)  # At least 50% width
+            min_h = int(video_height * 0.06)  # At least 6% height
 
             if w < min_w:
-                x = max(0, x - (min_w - w) // 2)
+                expand = (min_w - w) // 2
+                x = max(0, x - expand)
                 w = min_w
             if h < min_h:
                 h = min_h
 
-            # Keep within bounds
+            # Keep within screen bounds
             if x + w > video_width:
                 x = video_width - w
             if y + h > video_height:
                 y = video_height - h
+            x = max(0, x)
+            y = max(0, y)
 
-            logger.info(f"RENDER_TEXT: FINAL bbox: ({x}, {y}, {w}x{h}) for '{position}'")
+            logger.info(f"RENDER_TEXT: FINAL bbox for '{position}': ({x}, {y}, {w}x{h})")
             return (x, y, w, h)
 
-    # Fallback: use position hints
-    logger.warning(f"RENDER_TEXT: NO OCR detections! Using fallback for '{original_text}...'")
+    # Fallback: position-based defaults
+    logger.warning(f"RENDER_TEXT: No detections in zone '{position}'! Using fallback for '{original_text[:30]}...'")
 
-    translated_text = overlay.get("translated_text", original_text)
-    margin = int(video_width * 0.03)  # 3% margin
-    box_w = int(video_width * 0.94)   # 94% width for long text
-
-    # Estimate needed height based on translated text length
-    chars_per_line = max(1, box_w // 20)  # Rough estimate
-    num_lines = max(1, (len(translated_text) // chars_per_line) + 1)
-    box_h = max(int(video_height * 0.12), int(num_lines * 35 + 30))  # Min 12% height or calculated
-
-    x = margin
+    margin = int(video_width * 0.03)
+    box_w = int(video_width * 0.94)
+    box_h = int(video_height * 0.12)
 
     if position == "top":
-        y = int(video_height * 0.03)  # 3% from top
+        y = int(video_height * 0.02)
     elif position == "bottom":
-        y = int(video_height * 0.85) - box_h  # Position so bottom is at 85%
-    elif position == "center":
-        y = int(video_height * 0.45) - (box_h // 2)
+        y = int(video_height * 0.83)
     else:
-        y = int(video_height * 0.03)
+        y = int(video_height * 0.44)
 
-    return (x, y, box_w, box_h)
+    return (margin, y, box_w, box_h)
 
 
 def _estimate_text_height(text: str, font_size: int, box_width: int) -> int:
@@ -1114,73 +1110,45 @@ def _generate_ass_subtitles(
     subtitle_style: Optional[Dict] = None,
 ) -> str:
     """
-    Generate ASS (Advanced SubStation Alpha) subtitle file content.
+    Generate ASS subtitle file with SOTA Logic 2.0.
 
-    ASS provides:
-    - Precise positioning with {\pos(x,y)} or alignment codes
-    - Opaque background boxes with BorderStyle=3
-    - Fade animations with {\fad(in_ms, out_ms)}
-    - Proper text wrapping with \q2 (smart word wrap)
-    - Font styling, colors, outlines
+    Strategy: "Eraser Plate + Text" — two events per overlay:
+    1. Layer 0: Dark plate covering original text (eraser)
+    2. Layer 1: White translated text on top
 
-    Safe zones for TikTok/Reels (1080x1920):
-    - Top 15%: avoid (username, follow button)
-    - Bottom 25%: avoid (description, UI controls)
-    - Safe area: 15% - 75% of height
+    This GUARANTEES original text is covered, even if Inpaint fails.
     """
-    # Default colors
-    text_color = "#FFFFFF"  # white text
-    bg_color = "#000000"    # black background
-    bg_opacity = 0.85
+    # Font size: ~3.2% of video height for mobile readability
+    font_size = int(video_height * 0.032)
 
-    if subtitle_style:
-        text_color = subtitle_style.get("text_color", "#FFFFFF")
-        bg_color = subtitle_style.get("background_color", "#000000")
-        bg_opacity = subtitle_style.get("background_opacity", 0.85)
-
-    # Convert to ASS colors
-    primary_color = _hex_to_ass_color(text_color, 0.0)  # text fully opaque
-    outline_color = _hex_to_ass_color("#000000", 0.0)   # black outline
-    back_color = _hex_to_ass_color(bg_color, 1.0 - bg_opacity)  # background with transparency
-
-    # Calculate font size for PlayRes (ASS uses its own resolution)
-    # PlayRes sets the coordinate system; font size is relative to it
-    play_res_x = video_width
-    play_res_y = video_height
-
-    # Base font size: ~3.5% of video height for readability
-    base_font_size = int(video_height * 0.035)
-
-    # ASS header
+    # ASS Header with two styles:
+    # - EraserPlate: solid dark background to cover original
+    # - TranslatedText: white text with thin outline
     ass_content = f"""[Script Info]
-Title: TrafficPlant Translated Subtitles
+Title: TrafficPlant SOTA Subtitles v2
 ScriptType: v4.00+
-WrapStyle: 2
-PlayResX: {play_res_x}
-PlayResY: {play_res_y}
+WrapStyle: 0
+PlayResX: {video_width}
+PlayResY: {video_height}
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: BoxCaption,Noto Sans,{base_font_size},{primary_color},{primary_color},{outline_color},{back_color},-1,0,0,0,100,100,0,0,3,3,0,2,20,20,20,1
-Style: TextOnly,Noto Sans,{base_font_size},{primary_color},{primary_color},{outline_color},&H00000000,-1,0,0,0,100,100,0,0,1,2,1,2,20,20,20,1
+Style: EraserPlate,Arial,20,&H00202020,&H00202020,&H00202020,&H00202020,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
+Style: TranslatedText,Noto Sans,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.5,1,5,10,10,10,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-
-    # Safe zone boundaries for TikTok/Reels vertical video
-    # Top 15%: usernames, follow buttons
-    # Bottom 25%: description, music, UI controls
-    safe_top = int(video_height * 0.15)
-    safe_bottom = int(video_height * 0.75)
+    # Style breakdown:
+    # EraserPlate: PrimaryColour=&H00202020 (dark gray), BorderStyle=1, no outline/shadow
+    # TranslatedText: PrimaryColour=&H00FFFFFF (white BGR), Bold=0, Outline=1.5, Shadow=1
 
     for i, overlay in enumerate(translated_overlays):
         translated_text = overlay.get("translated_text", "")
         if not translated_text:
             continue
 
-        font_style = overlay.get("font_style", "rounded_background")
         appears_at = overlay.get("appears_at", 0.0)
         disappears_at = overlay.get("disappears_at", 0.0)
         position = overlay.get("position", "top")
@@ -1191,60 +1159,71 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if disappears_at <= appears_at:
             disappears_at = appears_at + 5.0
 
-        # Get bounding box from OCR
+        # Get bounding box from OCR (zone-filtered)
         x, y, box_w, box_h = _find_overlay_bbox(
             overlay, text_detections, video_width, video_height
         )
 
-        # Safe zone adjustment: move text into safe area if outside
-        # For "top" position, ensure we're not in top 15%
-        # For "bottom" position, ensure we're not in bottom 25%
-        if position == "top" and y < safe_top:
-            y = safe_top
-            logger.info(f"RENDER_TEXT: Adjusted top position to safe zone y={y}")
-        elif position == "bottom" and (y + box_h) > safe_bottom:
-            y = safe_bottom - box_h
-            if y < safe_top:  # If box is too tall, at least start at safe_top
-                y = safe_top
-            logger.info(f"RENDER_TEXT: Adjusted bottom position to safe zone y={y}")
-
-        # Word-wrap text for ASS (~25 chars per line for mobile)
-        wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=25)
-
-        # Choose style based on font_style
-        has_background = (
-            "background" in font_style.lower() or
-            "box" in font_style.lower() or
-            "caption" in font_style.lower()
-        )
-        style_name = "BoxCaption" if has_background else "TextOnly"
+        # NO safe zone adjustment — place EXACTLY over original text!
 
         # Format times
         start_time = _format_ass_time(appears_at)
         end_time = _format_ass_time(disappears_at)
 
-        # Build ASS override tags
-        # {\pos(x,y)} - absolute positioning (center of text at x,y)
-        # {\fad(in,out)} - fade in/out in milliseconds
-        # {\an8} = top-center alignment for position reference
+        # ═══════════════════════════════════════════════════════════════
+        # EVENT 1: ERASER PLATE (Layer 0)
+        # ═══════════════════════════════════════════════════════════════
+        # Draw solid rectangle using ASS vector drawing commands
+        # Padding: 15px around detected text bbox
+        pad = 15
+        plate_x1 = max(0, x - pad)
+        plate_y1 = max(0, y - pad)
+        plate_x2 = min(video_width, x + box_w + pad)
+        plate_y2 = min(video_height, y + box_h + pad)
 
-        # Position text at center of box
-        pos_x = x + box_w // 2
-        pos_y = y + box_h // 2
+        # ASS drawing: m = move, l = line
+        # Rectangle: move to top-left, line to each corner
+        plate_drawing = (
+            f"m {plate_x1} {plate_y1} "
+            f"l {plate_x2} {plate_y1} "
+            f"l {plate_x2} {plate_y2} "
+            f"l {plate_x1} {plate_y2}"
+        )
 
-        # Escape special characters for ASS
-        # ASS uses { } for override codes, so real braces need escaping (rare in captions)
+        # {\p1} enables drawing mode, {\c&HBBGGRR&} sets fill color
+        plate_event = (
+            f"Dialogue: 0,{start_time},{end_time},EraserPlate,,0,0,0,,"
+            f"{{\\p1\\c&H00202020&\\1a&H00&}}{plate_drawing}"
+        )
+        ass_content += plate_event + "\n"
+
+        # ═══════════════════════════════════════════════════════════════
+        # EVENT 2: TRANSLATED TEXT (Layer 1)
+        # ═══════════════════════════════════════════════════════════════
+        # Word-wrap text (~28 chars for mobile)
+        wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=28)
+
+        # Escape special ASS characters
         safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
 
-        # Fade animation: 200ms in, 200ms out
-        override_tags = f"{{\\pos({pos_x},{pos_y})\\fad(200,200)}}"
+        # Position: center of plate
+        cx = (plate_x1 + plate_x2) // 2
+        cy = (plate_y1 + plate_y2) // 2
 
-        # Create dialogue line
-        dialogue = f"Dialogue: 0,{start_time},{end_time},{style_name},,0,0,0,,{override_tags}{safe_text}"
-        ass_content += dialogue + "\n"
+        # {\an5} = center alignment, {\pos(x,y)} = absolute position
+        # {\fad(200,200)} = 200ms fade in/out
+        text_event = (
+            f"Dialogue: 1,{start_time},{end_time},TranslatedText,,0,0,0,,"
+            f"{{\\an5\\pos({cx},{cy})\\fad(200,200)}}{safe_text}"
+        )
+        ass_content += text_event + "\n"
 
-        logger.info(f"RENDER_TEXT ASS overlay {i}: style={style_name}, pos=({pos_x},{pos_y}), "
-                   f"time={start_time}-{end_time}, text='{translated_text[:30]}...'")
+        logger.info(
+            f"RENDER_TEXT ASS [{i}]: position='{position}' "
+            f"plate=({plate_x1},{plate_y1})-({plate_x2},{plate_y2}) "
+            f"text_center=({cx},{cy}) "
+            f"time={start_time}-{end_time}"
+        )
 
     return ass_content
 
