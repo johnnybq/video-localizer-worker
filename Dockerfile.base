@@ -46,11 +46,11 @@ RUN pip install --no-cache-dir "numpy<2" && \
 # ==============================================================================
 # Phase 2: VideoPainter — custom diffusers fork + model checkpoints
 # ==============================================================================
-# VideoPainter requires a modified diffusers with CogVideoXI2VDualInpaintAnyLPipeline
+# VideoPainter requires modified diffusers + pinned transformers==4.42.2 for FLAX_WEIGHTS_NAME
 RUN git clone --depth 1 https://github.com/TencentARC/VideoPainter.git /opt/videopainter && \
     cd /opt/videopainter/diffusers && \
     pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir --upgrade transformers peft accelerate
+    pip install --no-cache-dir transformers==4.42.2 peft accelerate
 
 # Download VideoPainter checkpoints (context encoder + LoRA adapter)
 # Models are cached in /workspace/models for persistence across runs
