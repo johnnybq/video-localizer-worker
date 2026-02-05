@@ -923,35 +923,40 @@ def _find_overlay_bbox(
     video_height: int,
 ) -> Tuple[int, int, int, int]:
     """
-    Find pixel bounding box for an overlay based on OCR detections in the target region.
+    Find pixel bounding box for an overlay based on OCR detections.
 
-    SIMPLE STRATEGY: Don't try to match text - just use ALL OCR detections in the region.
-    The overlay's position hint (top/bottom) tells us which region to look at.
+    AGGRESSIVE STRATEGY: Use position hint to filter, but if no detections found,
+    try the other half too. The goal is to ALWAYS use OCR coordinates if possible.
 
     Returns (x, y, w, h) in pixels.
     """
     position = overlay.get("position", "top")
-    original_text = overlay.get("text", "")[:50]  # For logging
+    original_text = overlay.get("text", "")[:40]
 
-    # Filter detections by vertical region
-    # Use generous boundaries to catch text that might be near the edge
+    # Log all detections for debugging
+    logger.info(f"RENDER_TEXT bbox: position='{position}', total_detections={len(text_detections)}")
+    for i, d in enumerate(text_detections[:5]):  # Log first 5
+        bbox = d.get("bbox_norm", [])
+        text = d.get("text", "")[:20]
+        logger.info(f"  det[{i}]: y={bbox[1]:.3f} text='{text}...'")
+
+    # Split detections into top and bottom halves
+    top_detections = [d for d in text_detections
+                      if d.get("bbox_norm", [0, 1, 0, 1])[1] < 0.5]
+    bottom_detections = [d for d in text_detections
+                         if d.get("bbox_norm", [0, 0, 0, 0])[1] >= 0.5]
+
+    logger.info(f"RENDER_TEXT: {len(top_detections)} top, {len(bottom_detections)} bottom detections")
+
+    # Choose detections based on position, with fallback
     if position == "top":
-        # Top region: y < 45% of video height
-        region_detections = [d for d in text_detections
-                            if d.get("bbox_norm", [0, 0.5, 0, 0.5])[1] < 0.45]
+        region_detections = top_detections if top_detections else bottom_detections
     elif position == "bottom":
-        # Bottom region: y > 55% of video height
-        region_detections = [d for d in text_detections
-                            if d.get("bbox_norm", [0, 0.5, 0, 0.5])[1] > 0.55]
+        region_detections = bottom_detections if bottom_detections else top_detections
     else:
-        # Center or unknown: use all detections
         region_detections = text_detections
 
-    logger.info(f"RENDER_TEXT: Position '{position}' - found {len(region_detections)} OCR detections in region (total: {len(text_detections)})")
-
     if region_detections:
-        # Use UNION of ALL detections in the region
-        # This ensures we cover all text, even if OCR split it into multiple boxes
         bboxes = [d["bbox_norm"] for d in region_detections if "bbox_norm" in d]
 
         if bboxes:
@@ -960,15 +965,11 @@ def _find_overlay_bbox(
             x_max = max(b[2] for b in bboxes)
             y_max = max(b[3] for b in bboxes)
 
-            # Add VERY GENEROUS padding to fully cover original text + background
-            # Instagram/TikTok text boxes often have rounded corners and padding
-            box_width = x_max - x_min
-            box_height = y_max - y_min
+            logger.info(f"RENDER_TEXT: OCR raw bbox: x=[{x_min:.3f},{x_max:.3f}] y=[{y_min:.3f},{y_max:.3f}]")
 
-            # Horizontal: extend to nearly full width for better coverage
-            pad_x = max(0.05, box_width * 0.3)  # At least 5% padding
-            # Vertical: generous padding for multi-line text
-            pad_y = max(0.02, box_height * 0.4)  # At least 2% padding
+            # GENEROUS padding - we want to FULLY cover the original text + background
+            pad_x = 0.03  # 3% horizontal padding
+            pad_y = 0.02  # 2% vertical padding
 
             x_min = max(0, x_min - pad_x)
             y_min = max(0, y_min - pad_y)
@@ -981,19 +982,27 @@ def _find_overlay_bbox(
             w = int((x_max - x_min) * video_width)
             h = int((y_max - y_min) * video_height)
 
-            # Ensure minimum dimensions
-            w = max(w, int(video_width * 0.8))  # At least 80% width
-            h = max(h, int(video_height * 0.12))  # At least 12% height
+            # Ensure reasonable minimum dimensions
+            min_w = int(video_width * 0.7)  # At least 70% width
+            min_h = int(video_height * 0.08)  # At least 8% height
 
-            # Re-center if width was expanded
-            if w > (x_max - x_min) * video_width:
-                x = max(0, (video_width - w) // 2)
+            if w < min_w:
+                x = max(0, x - (min_w - w) // 2)
+                w = min_w
+            if h < min_h:
+                h = min_h
 
-            logger.info(f"RENDER_TEXT: Using OCR union bbox: ({x}, {y}, {w}x{h}) from {len(bboxes)} detections")
+            # Keep within bounds
+            if x + w > video_width:
+                x = video_width - w
+            if y + h > video_height:
+                y = video_height - h
+
+            logger.info(f"RENDER_TEXT: FINAL bbox: ({x}, {y}, {w}x{h}) for '{position}'")
             return (x, y, w, h)
 
-    # Fallback: use position hints with very generous sizing
-    logger.warning(f"RENDER_TEXT: No OCR in '{position}' region for '{original_text}...', using fallback")
+    # Fallback: use position hints
+    logger.warning(f"RENDER_TEXT: NO OCR detections! Using fallback for '{original_text}...'")
 
     translated_text = overlay.get("translated_text", original_text)
     margin = int(video_width * 0.03)  # 3% margin
@@ -1034,15 +1043,15 @@ def _estimate_text_height(text: str, font_size: int, box_width: int) -> int:
     return int(lines * font_size * 1.3)  # 1.3 line spacing
 
 
-def _wrap_text_for_ffmpeg(text: str, max_chars_per_line: int) -> str:
+def _wrap_text_for_ass(text: str, max_chars_per_line: int = 25) -> str:
     """
-    Insert line breaks for ffmpeg drawtext.
+    Word-wrap text for ASS subtitles.
 
-    ffmpeg doesn't support automatic word-wrap, so we manually insert
-    newlines at appropriate points. Uses \\n which ffmpeg interprets as newline.
+    Uses \\N for hard line breaks in ASS format.
+    Default to ~25 chars per line (optimal for mobile viewing).
     """
     if max_chars_per_line <= 0:
-        max_chars_per_line = 40
+        max_chars_per_line = 25
 
     words = text.split()
     lines = []
@@ -1051,7 +1060,6 @@ def _wrap_text_for_ffmpeg(text: str, max_chars_per_line: int) -> str:
 
     for word in words:
         word_len = len(word)
-        # If adding this word exceeds limit and we have content, start new line
         if current_len + word_len + 1 > max_chars_per_line and current_line:
             lines.append(" ".join(current_line))
             current_line = [word]
@@ -1063,8 +1071,182 @@ def _wrap_text_for_ffmpeg(text: str, max_chars_per_line: int) -> str:
     if current_line:
         lines.append(" ".join(current_line))
 
-    # ffmpeg uses \n for newlines in drawtext, but we need to escape it
-    return "\\n".join(lines)
+    # ASS uses \N for hard line breaks
+    return "\\N".join(lines)
+
+
+def _hex_to_ass_color(hex_color: str, alpha: float = 0.0) -> str:
+    """
+    Convert hex color (#RRGGBB) to ASS format (&HAABBGGRR).
+
+    ASS uses BGR order and alpha at the start.
+    alpha: 0.0 = fully opaque, 1.0 = fully transparent
+    """
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) == 6:
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+    else:
+        r, g, b = 255, 255, 255  # default white
+
+    # Convert alpha (0-1 transparent scale) to ASS (0-255 where 0=opaque)
+    a = int(alpha * 255)
+
+    return f"&H{a:02X}{b:02X}{g:02X}{r:02X}"
+
+
+def _format_ass_time(seconds: float) -> str:
+    """Convert seconds to ASS time format (H:MM:SS.CC)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centisecs = int((seconds % 1) * 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
+
+
+def _generate_ass_subtitles(
+    translated_overlays: List[Dict],
+    text_detections: List[Dict],
+    video_width: int,
+    video_height: int,
+    video_duration: float,
+    subtitle_style: Optional[Dict] = None,
+) -> str:
+    """
+    Generate ASS (Advanced SubStation Alpha) subtitle file content.
+
+    ASS provides:
+    - Precise positioning with {\pos(x,y)} or alignment codes
+    - Opaque background boxes with BorderStyle=3
+    - Fade animations with {\fad(in_ms, out_ms)}
+    - Proper text wrapping with \q2 (smart word wrap)
+    - Font styling, colors, outlines
+
+    Safe zones for TikTok/Reels (1080x1920):
+    - Top 15%: avoid (username, follow button)
+    - Bottom 25%: avoid (description, UI controls)
+    - Safe area: 15% - 75% of height
+    """
+    # Default colors
+    text_color = "#FFFFFF"  # white text
+    bg_color = "#000000"    # black background
+    bg_opacity = 0.85
+
+    if subtitle_style:
+        text_color = subtitle_style.get("text_color", "#FFFFFF")
+        bg_color = subtitle_style.get("background_color", "#000000")
+        bg_opacity = subtitle_style.get("background_opacity", 0.85)
+
+    # Convert to ASS colors
+    primary_color = _hex_to_ass_color(text_color, 0.0)  # text fully opaque
+    outline_color = _hex_to_ass_color("#000000", 0.0)   # black outline
+    back_color = _hex_to_ass_color(bg_color, 1.0 - bg_opacity)  # background with transparency
+
+    # Calculate font size for PlayRes (ASS uses its own resolution)
+    # PlayRes sets the coordinate system; font size is relative to it
+    play_res_x = video_width
+    play_res_y = video_height
+
+    # Base font size: ~3.5% of video height for readability
+    base_font_size = int(video_height * 0.035)
+
+    # ASS header
+    ass_content = f"""[Script Info]
+Title: TrafficPlant Translated Subtitles
+ScriptType: v4.00+
+WrapStyle: 2
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: BoxCaption,Noto Sans,{base_font_size},{primary_color},{primary_color},{outline_color},{back_color},-1,0,0,0,100,100,0,0,3,3,0,2,20,20,20,1
+Style: TextOnly,Noto Sans,{base_font_size},{primary_color},{primary_color},{outline_color},&H00000000,-1,0,0,0,100,100,0,0,1,2,1,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    # Safe zone boundaries for TikTok/Reels vertical video
+    # Top 15%: usernames, follow buttons
+    # Bottom 25%: description, music, UI controls
+    safe_top = int(video_height * 0.15)
+    safe_bottom = int(video_height * 0.75)
+
+    for i, overlay in enumerate(translated_overlays):
+        translated_text = overlay.get("translated_text", "")
+        if not translated_text:
+            continue
+
+        font_style = overlay.get("font_style", "rounded_background")
+        appears_at = overlay.get("appears_at", 0.0)
+        disappears_at = overlay.get("disappears_at", 0.0)
+        position = overlay.get("position", "top")
+
+        # Extend to video end if needed
+        if disappears_at < video_duration - 0.5:
+            disappears_at = video_duration
+        if disappears_at <= appears_at:
+            disappears_at = appears_at + 5.0
+
+        # Get bounding box from OCR
+        x, y, box_w, box_h = _find_overlay_bbox(
+            overlay, text_detections, video_width, video_height
+        )
+
+        # Safe zone adjustment: move text into safe area if outside
+        # For "top" position, ensure we're not in top 15%
+        # For "bottom" position, ensure we're not in bottom 25%
+        if position == "top" and y < safe_top:
+            y = safe_top
+            logger.info(f"RENDER_TEXT: Adjusted top position to safe zone y={y}")
+        elif position == "bottom" and (y + box_h) > safe_bottom:
+            y = safe_bottom - box_h
+            if y < safe_top:  # If box is too tall, at least start at safe_top
+                y = safe_top
+            logger.info(f"RENDER_TEXT: Adjusted bottom position to safe zone y={y}")
+
+        # Word-wrap text for ASS (~25 chars per line for mobile)
+        wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=25)
+
+        # Choose style based on font_style
+        has_background = (
+            "background" in font_style.lower() or
+            "box" in font_style.lower() or
+            "caption" in font_style.lower()
+        )
+        style_name = "BoxCaption" if has_background else "TextOnly"
+
+        # Format times
+        start_time = _format_ass_time(appears_at)
+        end_time = _format_ass_time(disappears_at)
+
+        # Build ASS override tags
+        # {\pos(x,y)} - absolute positioning (center of text at x,y)
+        # {\fad(in,out)} - fade in/out in milliseconds
+        # {\an8} = top-center alignment for position reference
+
+        # Position text at center of box
+        pos_x = x + box_w // 2
+        pos_y = y + box_h // 2
+
+        # Escape special characters for ASS
+        # ASS uses { } for override codes, so real braces need escaping (rare in captions)
+        safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
+
+        # Fade animation: 200ms in, 200ms out
+        override_tags = f"{{\\pos({pos_x},{pos_y})\\fad(200,200)}}"
+
+        # Create dialogue line
+        dialogue = f"Dialogue: 0,{start_time},{end_time},{style_name},,0,0,0,,{override_tags}{safe_text}"
+        ass_content += dialogue + "\n"
+
+        logger.info(f"RENDER_TEXT ASS overlay {i}: style={style_name}, pos=({pos_x},{pos_y}), "
+                   f"time={start_time}-{end_time}, text='{translated_text[:30]}...'")
+
+    return ass_content
 
 
 def stage_render_text(
@@ -1076,16 +1258,18 @@ def stage_render_text(
     subtitle_style: Optional[Dict] = None,
 ) -> str:
     """
-    Render translated text overlays onto video using ffmpeg drawbox + drawtext.
+    Render translated text overlays onto video using ASS subtitles.
 
-    Strategy based on font_style:
-    - "rounded_background" (most TikTok/Reels): Draw opaque box covering original + translated text
-    - Other: Draw text with thin border/shadow (assumes inpaint already removed original)
+    ASS (Advanced SubStation Alpha) provides:
+    - Precise positioning with {\pos(x,y)}
+    - Opaque background boxes with BorderStyle=3
+    - Fade-in/fade-out animations with {\fad(200,200)}
+    - Smart word-wrapping (~25 chars per line for mobile)
+    - Safe zone awareness (avoid TikTok UI elements)
 
-    Uses ffmpeg filter_complex with enable='between(t,start,end)' for timing.
     Zero VRAM — pure CPU/ffmpeg.
     """
-    logger.info(f"Stage: RENDER_TEXT ({len(translated_overlays)} overlays)")
+    logger.info(f"Stage: RENDER_TEXT ASS ({len(translated_overlays)} overlays)")
 
     if not translated_overlays:
         logger.info("No overlays to render, skipping")
@@ -1094,159 +1278,47 @@ def stage_render_text(
     video_width, video_height = resolution
     output_path = video_path.replace(".mp4", "_textrendered.mp4")
 
-    # Find a suitable font (Noto Sans covers most languages)
-    font_candidates = [
-        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    ]
-    font_path = None
-    for f in font_candidates:
-        if os.path.exists(f):
-            font_path = f
-            break
+    # Get video duration to ensure overlays extend to end
+    import cv2 as cv2_render
+    cap = cv2_render.VideoCapture(video_path)
+    frame_count = int(cap.get(cv2_render.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2_render.CAP_PROP_FPS) or fps
+    video_duration = frame_count / video_fps if video_fps > 0 else 10.0
+    cap.release()
+    logger.info(f"RENDER_TEXT: Video duration = {video_duration:.1f}s, resolution = {video_width}x{video_height}")
 
-    # Build ffmpeg filter chain
-    filters = []
+    # Generate ASS subtitle content
+    ass_content = _generate_ass_subtitles(
+        translated_overlays=translated_overlays,
+        text_detections=text_detections,
+        video_width=video_width,
+        video_height=video_height,
+        video_duration=video_duration,
+        subtitle_style=subtitle_style,
+    )
 
-    for i, overlay in enumerate(translated_overlays):
-        translated_text = overlay.get("translated_text", "")
-        if not translated_text:
-            continue
+    # Write ASS file to temp location
+    ass_path = video_path.replace(".mp4", "_subs.ass")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+    logger.info(f"RENDER_TEXT: Generated ASS file: {ass_path}")
 
-        font_style = overlay.get("font_style", "rounded_background")
-        appears_at = overlay.get("appears_at", 0.0)
-        disappears_at = overlay.get("disappears_at", 0.0)
-        if disappears_at <= appears_at:
-            disappears_at = appears_at + 5.0  # default 5s display
+    # Log ASS content for debugging (first 1000 chars)
+    logger.info(f"RENDER_TEXT: ASS preview:\n{ass_content[:1000]}")
 
-        # Get bounding box for this overlay
-        x, y, box_w, box_h = _find_overlay_bbox(
-            overlay, text_detections, video_width, video_height
-        )
-
-        # Calculate font size to fit text in box
-        # Start with size based on box height, then check if text fits width
-        font_size = min(36, max(18, int(box_h * 0.22)))
-
-        # Calculate characters per line for word-wrapping
-        # Estimate ~0.55 * font_size per character width
-        text_padding = 20  # padding inside box
-        usable_width = box_w - text_padding * 2
-        chars_per_line = max(15, int(usable_width / (font_size * 0.55)))
-
-        # Word-wrap the translated text BEFORE escaping
-        wrapped_text = _wrap_text_for_ffmpeg(translated_text, chars_per_line)
-        num_lines = wrapped_text.count("\\n") + 1
-
-        # Recalculate needed height based on wrapped text
-        line_height = int(font_size * 1.3)
-        needed_height = num_lines * line_height + text_padding * 2
-
-        if needed_height > box_h:
-            # Expand box height to fit translation
-            box_h = needed_height
-            # Ensure we don't go off-screen
-            if y + box_h > video_height:
-                y = max(5, video_height - box_h - 5)
-
-        # Escape text for ffmpeg (single quotes, backslashes, colons)
-        # Note: wrapped_text already has \\n for newlines
-        escaped_text = (
-            wrapped_text
-            .replace("'", "\u2019")  # curly apostrophe (avoids ffmpeg escaping hell)
-            .replace(":", "\\:")
-            .replace("[", "\\[")
-            .replace("]", "\\]")
-            .replace("%", "%%")
-        )
-
-        logger.info(f"RENDER_TEXT overlay {i}: {len(translated_text)} chars → {num_lines} lines, font={font_size}, box=({x},{y},{box_w}x{box_h})")
-
-        enable = f"enable='between(t,{appears_at:.2f},{disappears_at:.2f})'"
-
-        # Check if this style requires a background box
-        # Gemini may return various font_style values like "rounded_sans_background",
-        # "rounded_background", "box_background", etc.
-        has_background = (
-            "background" in font_style.lower() or
-            "box" in font_style.lower() or
-            "caption" in font_style.lower()
-        )
-
-        if has_background:
-            # STRATEGY: Draw opaque box covering original overlay, then text inside
-            # The box covers the original Russian text + background completely
-            # Use subtitle_style colors if available, else defaults
-            if subtitle_style:
-                bg_hex = subtitle_style.get("background_color", "#000000")
-                bg_opacity = subtitle_style.get("background_opacity", 0.85)
-                text_hex = subtitle_style.get("text_color", "#FFFFFF")
-                # Convert hex to ffmpeg format (0xRRGGBB)
-                box_color = f"{bg_hex.replace('#', '0x')}@{bg_opacity}"
-                text_color = text_hex.replace("#", "0x")
-            else:
-                box_color = "black@0.85"
-                text_color = "white"
-
-            # Draw background box
-            filters.append(
-                f"drawbox=x={x}:y={y}:w={box_w}:h={box_h}"
-                f":color={box_color}:t=fill:{enable}"
-            )
-
-            # Draw translated text centered in box
-            text_x = x + 10  # small left padding
-            text_y = y + 10  # small top padding
-            text_max_w = box_w - 20  # leave padding on both sides
-
-            font_arg = f":fontfile={font_path}" if font_path else ""
-            filters.append(
-                f"drawtext=text='{escaped_text}'"
-                f":x={text_x}:y={text_y}"
-                f":fontsize={font_size}"
-                f":fontcolor={text_color}"
-                f":borderw=2:bordercolor=black@0.6"
-                f"{font_arg}"
-                f":{enable}"
-            )
-        else:
-            # STRATEGY: Text only (inpaint should have removed original)
-            # Draw text with strong border for readability
-            text_x = x + 5
-            text_y = y + 5
-            font_arg = f":fontfile={font_path}" if font_path else ""
-            filters.append(
-                f"drawtext=text='{escaped_text}'"
-                f":x={text_x}:y={text_y}"
-                f":fontsize={font_size}"
-                f":fontcolor=white"
-                f":borderw=3:bordercolor=black"
-                f":shadowx=2:shadowy=2:shadowcolor=black@0.7"
-                f"{font_arg}"
-                f":{enable}"
-            )
-
-    if not filters:
-        logger.info("No valid overlay filters generated, skipping render")
-        return video_path
-
-    # Join all filters and run ffmpeg
-    filter_chain = ",".join(filters)
-
+    # Use ffmpeg with ASS filter
+    # Note: ASS filter path needs escaping for Windows-style paths or special chars
+    # We use the simple form since we're on Linux
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
-        "-vf", filter_chain,
+        "-vf", f"ass={ass_path}",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-c:a", "copy",
         output_path,
     ]
 
-    logger.info(f"RENDER_TEXT: Running ffmpeg with {len(filters)} filter(s)")
+    logger.info(f"RENDER_TEXT: Running ffmpeg with ASS filter")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
     if result.returncode != 0:
@@ -1258,7 +1330,13 @@ def stage_render_text(
         logger.error("RENDER_TEXT: output file not created")
         return video_path
 
-    logger.info(f"RENDER_TEXT: Successfully rendered {len(filters)} overlay filter(s)")
+    # Clean up temp ASS file
+    try:
+        os.remove(ass_path)
+    except Exception:
+        pass
+
+    logger.info(f"RENDER_TEXT: Successfully rendered {len(translated_overlays)} overlay(s) via ASS")
     return output_path
 
 

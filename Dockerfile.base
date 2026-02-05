@@ -18,13 +18,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     git-lfs \
-    # Fonts for text rendering (RENDER_TEXT stage)
+    # ASS subtitle rendering (RENDER_TEXT stage)
+    libass9 \
+    fontconfig \
+    # Fonts for text rendering
     fonts-noto-core \
+    fonts-noto-cjk \
     fonts-dejavu-core \
     fonts-freefont-ttf \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python \
-    && git lfs install
+    && git lfs install \
+    && fc-cache -fv
 
 WORKDIR /app
 
