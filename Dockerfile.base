@@ -68,9 +68,12 @@ RUN mkdir -p /workspace/models/videopainter && \
 # Phase 2b: ProPainter — fallback inpainting when VideoPainter fails
 # ==============================================================================
 # E2FGVI-based video inpainting, used as fallback before Replicate API
+# NOTE: ProPainter may try to install numpy>=2, we force downgrade after
 RUN git clone --depth 1 https://github.com/sczhou/ProPainter.git /models/ProPainter && \
     cd /models/ProPainter && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir "numpy<2" && \
+    echo "numpy version after ProPainter fix:" && python3 -c "import numpy; print(numpy.__version__)"
 
 # Download ProPainter model weights (~500MB total)
 RUN mkdir -p /models/ProPainter/weights && \
