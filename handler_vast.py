@@ -52,6 +52,47 @@ from handler import handler as run_localization, get_model_manager, set_progress
 
 
 # =============================================================================
+# Task Validation
+# =============================================================================
+
+def validate_task(task: Dict[str, Any]) -> tuple:
+    """
+    Validate task structure before processing.
+
+    Returns:
+        (is_valid: bool, error_message: str)
+    """
+    if not isinstance(task, dict):
+        return False, f"Task must be dict, got {type(task).__name__}"
+
+    if "task_id" not in task:
+        return False, "Missing required field: task_id"
+
+    if "payload" not in task:
+        return False, "Missing required field: payload"
+
+    payload = task.get("payload", {})
+    if not isinstance(payload, dict):
+        return False, f"payload must be dict, got {type(payload).__name__}"
+
+    # Required payload fields
+    required_fields = ["video_url", "target_language"]
+    missing = [f for f in required_fields if f not in payload]
+    if missing:
+        return False, f"Missing required payload fields: {', '.join(missing)}"
+
+    # Validate video_url is not empty
+    if not payload.get("video_url"):
+        return False, "payload.video_url is empty"
+
+    # Validate target_language is not empty
+    if not payload.get("target_language"):
+        return False, "payload.target_language is empty"
+
+    return True, ""
+
+
+# =============================================================================
 # GPU Info
 # =============================================================================
 
@@ -143,6 +184,17 @@ def process_task(task: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Result dict from handler.
     """
+    # Validate task structure before processing
+    is_valid, error_msg = validate_task(task)
+    if not is_valid:
+        log.error(f"Task validation failed: {error_msg}")
+        log.error(f"Task data: {task}")
+        return {
+            "status": "error",
+            "error": f"Task validation failed: {error_msg}",
+            "validation_error": True,
+        }
+
     task_id = task["task_id"]
     payload = task["payload"]
     geo = task.get("geo", "?")

@@ -100,6 +100,62 @@ class PipelineStage(Enum):
 CRITICAL_STAGES = {"transcribe", "translate", "tts", "assemble"}
 
 
+# =============================================================================
+# Language Code Normalization
+# =============================================================================
+
+LANGUAGE_CODE_MAP = {
+    "en": ["en", "en-US", "en-GB", "en-AU"],
+    "pt": ["pt", "pt-BR", "pt-PT"],
+    "es": ["es", "es-MX", "es-ES", "es-AR"],
+    "ru": ["ru", "ru-RU"],
+    "de": ["de", "de-DE", "de-AT", "de-CH"],
+    "fr": ["fr", "fr-FR", "fr-CA"],
+    "zh": ["zh", "zh-CN", "zh-TW", "zh-HK"],
+    "ja": ["ja", "ja-JP"],
+    "ko": ["ko", "ko-KR"],
+    "ar": ["ar", "ar-SA"],
+    "hi": ["hi", "hi-IN"],
+    "it": ["it", "it-IT"],
+    "nl": ["nl", "nl-NL"],
+    "pl": ["pl", "pl-PL"],
+    "tr": ["tr", "tr-TR"],
+    "uk": ["uk", "uk-UA"],
+    "vi": ["vi", "vi-VN"],
+    "th": ["th", "th-TH"],
+    "id": ["id", "id-ID"],
+}
+
+# Build reverse lookup: locale → base language
+_GEO_TO_BASE = {}
+for base, geos in LANGUAGE_CODE_MAP.items():
+    for geo in geos:
+        _GEO_TO_BASE[geo.lower()] = base
+
+
+def normalize_language_code(code: str) -> str:
+    """
+    Normalize a language code to its base form.
+    Examples: 'pt-BR' → 'pt', 'en-US' → 'en', 'ru' → 'ru'
+    """
+    if not code:
+        return ""
+    code_lower = code.lower().strip()
+    return _GEO_TO_BASE.get(code_lower, code_lower.split("-")[0])
+
+
+def are_languages_same(lang1: str, lang2: str) -> bool:
+    """
+    Check if two language codes refer to the same base language.
+    Examples: are_languages_same('pt', 'pt-BR') → True
+              are_languages_same('en-US', 'en-GB') → True
+              are_languages_same('pt', 'es') → False
+    """
+    if not lang1 or not lang2:
+        return False
+    return normalize_language_code(lang1) == normalize_language_code(lang2)
+
+
 def diagnose_videopainter() -> Dict[str, Any]:
     """
     Diagnose VideoPainter dependencies at startup.
@@ -108,12 +164,13 @@ def diagnose_videopainter() -> Dict[str, Any]:
     results = {
         "videopainter_root": False,
         "videopainter_checkpoints": False,
+        "videopainter_branch": False,  # LoRA adapter (CRITICAL!)
         "cogvideox_model": False,
         "custom_diffusers_pipeline": False,
         "errors": []
     }
 
-    # Check VIDEOPAINTER_ROOT
+    # Check VIDEOPAINTER_ROOT (custom diffusers code)
     vp_root = os.environ.get("VIDEOPAINTER_ROOT", "/opt/videopainter")
     if os.path.exists(vp_root):
         results["videopainter_root"] = True
@@ -122,14 +179,40 @@ def diagnose_videopainter() -> Dict[str, Any]:
         results["errors"].append(f"VIDEOPAINTER_ROOT not found: {vp_root}")
         logger.warning(f"✗ VIDEOPAINTER_ROOT not found: {vp_root}")
 
-    # Check checkpoints
+    # Check checkpoints directory
     vp_ckpt = os.environ.get("VIDEOPAINTER_CKPT", "/workspace/models/videopainter/checkpoints")
     if os.path.exists(vp_ckpt):
         results["videopainter_checkpoints"] = True
         logger.info(f"✓ VIDEOPAINTER_CKPT exists: {vp_ckpt}")
+        # List contents for debugging
+        try:
+            ckpt_contents = os.listdir(vp_ckpt)
+            logger.info(f"  Contents: {ckpt_contents}")
+        except Exception as e:
+            logger.warning(f"  Could not list contents: {e}")
     else:
         results["errors"].append(f"VIDEOPAINTER_CKPT not found: {vp_ckpt}")
         logger.warning(f"✗ VIDEOPAINTER_CKPT not found: {vp_ckpt}")
+
+    # Check branch directory (LoRA adapter) - CRITICAL for inpainting quality!
+    branch_path = os.path.join(vp_ckpt, "branch")
+    if os.path.exists(branch_path):
+        results["videopainter_branch"] = True
+        logger.info(f"✓ VideoPainter branch (LoRA) exists: {branch_path}")
+        # Check for adapter files
+        try:
+            branch_contents = os.listdir(branch_path)
+            has_adapter = any("adapter" in f.lower() or "lora" in f.lower() or f.endswith(".safetensors") for f in branch_contents)
+            logger.info(f"  Branch contents: {branch_contents[:10]}")
+            if has_adapter:
+                logger.info(f"  ✓ LoRA adapter files found")
+            else:
+                logger.warning(f"  ⚠ No obvious adapter files found, but directory exists")
+        except Exception as e:
+            logger.warning(f"  Could not list branch contents: {e}")
+    else:
+        results["errors"].append(f"CRITICAL: VideoPainter branch (LoRA) not found at {branch_path}")
+        logger.error(f"✗ CRITICAL: VideoPainter branch (LoRA) not found: {branch_path}")
 
     # Check CogVideoX model (may need to download)
     hf_home = os.environ.get("HF_HOME", "/workspace/models/huggingface")
@@ -357,6 +440,11 @@ class ModelManager:
             # Uses custom CogVideoXI2VInpaintAnyLPipeline from their diffusers fork
             vp_root = os.environ.get("VIDEOPAINTER_ROOT", "/opt/videopainter")
             vp_ckpt = os.environ.get("VIDEOPAINTER_CKPT", "/workspace/models/videopainter/checkpoints")
+
+            logger.info(f"VideoPainter: VIDEOPAINTER_ROOT={vp_root}")
+            logger.info(f"VideoPainter: VIDEOPAINTER_CKPT={vp_ckpt}")
+
+            # Add VideoPainter's custom diffusers to path
             sys.path.insert(0, vp_root)
 
             from diffusers import CogVideoXTransformer3DModel
@@ -368,20 +456,46 @@ class ModelManager:
                                        "THUDM/CogVideoX-5b-I2V")
             # Download base model if not cached
             if not os.path.exists(model_path):
+                logger.info(f"VideoPainter: CogVideoX model not cached, will download from HuggingFace")
                 model_path = "THUDM/CogVideoX-5b-I2V"
+            else:
+                logger.info(f"VideoPainter: Using cached CogVideoX model at {model_path}")
 
-            branch_path = os.path.join(vp_ckpt, "checkpoints", "branch")
+            # vp_ckpt already ends with "/checkpoints", so just add "branch"
+            branch_path = os.path.join(vp_ckpt, "branch")
 
+            # Check if branch (LoRA adapter) exists
+            if os.path.exists(branch_path):
+                logger.info(f"VideoPainter: ✓ Branch (LoRA) found at {branch_path}")
+                # List contents for debugging
+                try:
+                    branch_contents = os.listdir(branch_path)
+                    logger.info(f"VideoPainter: Branch contents: {branch_contents[:5]}...")
+                except Exception as e:
+                    logger.warning(f"VideoPainter: Could not list branch contents: {e}")
+            else:
+                logger.error(f"VideoPainter: ✗ Branch NOT found at {branch_path}")
+                logger.error(f"VideoPainter: Contents of {vp_ckpt}: {os.listdir(vp_ckpt) if os.path.exists(vp_ckpt) else 'DIR NOT FOUND'}")
+                raise FileNotFoundError(
+                    f"VideoPainter branch (LoRA adapter) not found at {branch_path}. "
+                    f"Check VIDEOPAINTER_CKPT env var and ensure HF clone completed."
+                )
+
+            logger.info("VideoPainter: Loading CogVideoXTransformer3DModel...")
             transformer = CogVideoXTransformer3DModel.from_pretrained(
                 model_path, subfolder="transformer", torch_dtype=torch.bfloat16
             )
+
+            logger.info("VideoPainter: Loading CogVideoXI2VInpaintAnyLPipeline with branch...")
             pipe = CogVideoXI2VInpaintAnyLPipeline.from_pretrained(
                 model_path,
-                branch=branch_path if os.path.exists(branch_path) else None,
+                branch=branch_path,
                 transformer=transformer,
                 torch_dtype=torch.bfloat16,
             ).to(self.device)
+
             pipe.enable_xformers_memory_efficient_attention()
+            logger.info("VideoPainter: ✓ Pipeline loaded successfully with xformers")
             return pipe
 
         elif name == "video_retalking":
@@ -749,88 +863,156 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
 
 
 def _inpaint_propainter(video_path: str, mask_path: str, output_path: str) -> str:
-    """Inpaint using ProPainter (E2FGVI-based)."""
+    """
+    Inpaint using ProPainter (E2FGVI-based) via command-line interface.
+    ProPainter is a script, not a Python module, so we call it via subprocess.
+    """
     import cv2
-    from PIL import Image
 
-    # Check if ProPainter is available
-    try:
-        sys.path.insert(0, "/models/ProPainter")
-        from inference_propainter import ProPainterInference
-    except ImportError:
-        # Use Replicate API as fallback
+    propainter_dir = "/models/ProPainter"
+    propainter_script = os.path.join(propainter_dir, "inference_propainter.py")
+
+    # Check if ProPainter is installed
+    if not os.path.exists(propainter_script):
+        logger.warning(f"ProPainter not found at {propainter_script}, falling back to Replicate")
         return _inpaint_replicate(video_path, mask_path, output_path)
 
-    # Local ProPainter inference
-    propainter = ProPainterInference(device="cuda")
+    # ProPainter expects a directory with frames and masks, not video files
+    # Create temp directories for frames
+    video_frames_dir = tempfile.mkdtemp(prefix="propainter_video_")
+    mask_frames_dir = tempfile.mkdtemp(prefix="propainter_mask_")
+    result_dir = tempfile.mkdtemp(prefix="propainter_result_")
 
-    # Extract frames
-    cap = cv2.VideoCapture(video_path)
-    mask_cap = cv2.VideoCapture(mask_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    try:
+        # Extract video frames
+        logger.info(f"ProPainter: Extracting video frames to {video_frames_dir}")
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_idx = 0
 
-    frames = []
-    masks = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            cv2.imwrite(os.path.join(video_frames_dir, f"{frame_idx:05d}.png"), frame)
+            frame_idx += 1
+        cap.release()
+        logger.info(f"ProPainter: Extracted {frame_idx} video frames")
 
-    while True:
-        ret, frame = cap.read()
-        ret_m, mask = mask_cap.read()
-        if not ret or not ret_m:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        masks.append(cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY))
+        # Extract mask frames
+        logger.info(f"ProPainter: Extracting mask frames to {mask_frames_dir}")
+        mask_cap = cv2.VideoCapture(mask_path)
+        mask_idx = 0
 
-    cap.release()
-    mask_cap.release()
+        while True:
+            ret, mask = mask_cap.read()
+            if not ret:
+                break
+            # Convert to grayscale if needed
+            if len(mask.shape) == 3:
+                mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+            cv2.imwrite(os.path.join(mask_frames_dir, f"{mask_idx:05d}.png"), mask)
+            mask_idx += 1
+        mask_cap.release()
 
-    # Process in batches (memory efficiency)
-    batch_size = 10
-    inpainted_frames = []
+        # Pad masks if shorter than video
+        while mask_idx < frame_idx:
+            last_mask = os.path.join(mask_frames_dir, f"{mask_idx-1:05d}.png")
+            new_mask = os.path.join(mask_frames_dir, f"{mask_idx:05d}.png")
+            shutil.copy(last_mask, new_mask)
+            mask_idx += 1
 
-    for i in range(0, len(frames), batch_size):
-        batch_frames = frames[i:i+batch_size]
-        batch_masks = masks[i:i+batch_size]
+        logger.info(f"ProPainter: {mask_idx} mask frames ready")
 
-        result = propainter.inpaint(
-            frames=batch_frames,
-            masks=batch_masks,
-            resize_ratio=0.5  # Balance quality/speed
+        # Run ProPainter
+        cmd = [
+            "python", propainter_script,
+            "--video", video_frames_dir,
+            "--mask", mask_frames_dir,
+            "--output", result_dir,
+            "--resize_ratio", "0.5",  # Memory optimization
+            "--ref_stride", "10",
+            "--neighbor_length", "10",
+            "--subvideo_length", "80",
+            "--fp16",  # Use half precision
+        ]
+
+        logger.info(f"ProPainter: Running {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            cwd=propainter_dir,
+            capture_output=True,
+            timeout=600,  # 10 min timeout
         )
-        inpainted_frames.extend(result)
 
-    # Write output
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if result.returncode != 0:
+            logger.error(f"ProPainter failed: {result.stderr.decode()[:500]}")
+            raise RuntimeError(f"ProPainter subprocess failed: {result.stderr.decode()[:200]}")
 
-    for frame in inpainted_frames:
-        frame_bgr = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
-        frame_resized = cv2.resize(frame_bgr, (width, height))
-        out.write(frame_resized)
+        # Find output video in result_dir
+        result_files = [f for f in os.listdir(result_dir) if f.endswith(('.mp4', '.avi'))]
+        if not result_files:
+            # ProPainter outputs frames, need to reassemble
+            logger.info("ProPainter: Reassembling frames to video")
+            result_frames = sorted([f for f in os.listdir(result_dir) if f.endswith('.png')])
+            if not result_frames:
+                raise RuntimeError("ProPainter produced no output frames")
 
-    out.release()
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # Re-add audio
-    _copy_audio(video_path, output_path)
+            for fname in result_frames:
+                frame = cv2.imread(os.path.join(result_dir, fname))
+                frame_resized = cv2.resize(frame, (width, height))
+                out.write(frame_resized)
+            out.release()
+        else:
+            # Copy result video
+            shutil.copy(os.path.join(result_dir, result_files[0]), output_path)
 
-    return output_path
+        # Re-add original audio
+        _copy_audio(video_path, output_path)
+
+        logger.info(f"ProPainter: Success! Output saved to {output_path}")
+        return output_path
+
+    finally:
+        # Cleanup temp directories
+        for d in [video_frames_dir, mask_frames_dir, result_dir]:
+            try:
+                shutil.rmtree(d)
+            except Exception:
+                pass
 
 
 def _inpaint_replicate(video_path: str, mask_path: str, output_path: str) -> str:
     """Fallback: Use Replicate API for ProPainter."""
     import replicate
     import httpx
+    import base64
 
-    # Upload video to temp storage
-    # For now, assume video_path is already a URL or we need presigned upload
     logger.info("Using Replicate ProPainter API")
+
+    # Replicate API expects URLs or base64 data URIs, NOT file handles
+    def file_to_data_uri(path: str, mime: str) -> str:
+        """Convert local file to base64 data URI for Replicate API."""
+        with open(path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:{mime};base64,{data}"
+
+    # Convert video and mask files to data URIs
+    video_uri = file_to_data_uri(video_path, "video/mp4")
+    mask_uri = file_to_data_uri(mask_path, "video/mp4")
+
+    logger.info(f"Replicate: video data URI length: {len(video_uri)}, mask data URI length: {len(mask_uri)}")
 
     output = replicate.run(
         "sczhou/propainter:34a544b1df7e77e08d5d1648e8b28899cb7f8c47a28aaef54eae16ebf6f4c34a",
         input={
-            "video": open(video_path, "rb"),
-            "mask": open(mask_path, "rb"),
+            "video": video_uri,
+            "mask": mask_uri,
             "resize_ratio": 0.5,
             "ref_stride": 10,
             "neighbor_length": 10,
@@ -838,12 +1020,23 @@ def _inpaint_replicate(video_path: str, mask_path: str, output_path: str) -> str
         }
     )
 
-    # Download result
+    # Download result — output can be string URL or list
+    if isinstance(output, str):
+        result_url = output
+    elif isinstance(output, list) and len(output) > 0:
+        result_url = str(output[0])
+    else:
+        result_url = str(output)
+
+    logger.info(f"Replicate: downloading result from {result_url[:100]}...")
+
     with httpx.Client(timeout=120) as client:
-        resp = client.get(output)
+        resp = client.get(result_url)
+        resp.raise_for_status()
         with open(output_path, "wb") as f:
             f.write(resp.content)
 
+    logger.info(f"Replicate: saved {len(resp.content)} bytes to {output_path}")
     return output_path
 
 
@@ -1647,21 +1840,29 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
 
         # Step 2: Generate speech with cloned voice
         try:
+            # Build TTS payload with language_code for proper pronunciation
+            tts_payload = {
+                "text": text,
+                "model_id": "eleven_v3",
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.85,
+                    "style": 0.3,
+                },
+            }
+            # Add language_code for eleven_v3 (supports 70+ languages)
+            lang_code = normalize_language_code(target_language)
+            if lang_code:
+                tts_payload["language_code"] = lang_code
+                logger.info(f"ElevenLabs: using language_code={lang_code} (from {target_language})")
+
             tts_resp = httpx.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
                 headers={
                     "xi-api-key": api_key,
                     "Content-Type": "application/json",
                 },
-                json={
-                    "text": text,
-                    "model_id": "eleven_v3",
-                    "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.85,
-                        "style": 0.3,
-                    },
-                },
+                json=tts_payload,
                 timeout=60,
             )
             if tts_resp.status_code != 200:
@@ -1709,12 +1910,12 @@ def _tts_f5(text: str, reference_audio: str, mm: ModelManager) -> str:
     return output_path
 
 
-def stage_tts(text: str, reference_audio: str, mm: ModelManager) -> str:
+def stage_tts(text: str, reference_audio: str, mm: ModelManager, target_language: str = "en") -> str:
     """Generate speech: ElevenLabs API (primary) → F5-TTS local (fallback)."""
-    logger.info("Stage: TTS")
+    logger.info(f"Stage: TTS (target_language={target_language})")
 
     # Primary: ElevenLabs (runs from US GPU IP — no geo-block)
-    result = _tts_elevenlabs(text, reference_audio)
+    result = _tts_elevenlabs(text, reference_audio, target_language=target_language)
     if result:
         return result
 
@@ -2182,8 +2383,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         state["translated_text"] = config.translated_text
                     elif state.get("transcript"):
                         src_lang = state["transcript"]["language"]
-                        tgt_lang = config.target_language.split("-")[0]  # pt-BR → pt
-                        if src_lang == tgt_lang:
+                        # Use proper language comparison (handles pt == pt-BR, en == en-US, etc.)
+                        if are_languages_same(src_lang, config.target_language):
+                            logger.info(f"Source and target languages are same family: {src_lang} ≈ {config.target_language}")
                             state["translated_text"] = state["transcript"]["full_text"]
                         else:
                             # No server translation and languages differ — critical error
@@ -2199,7 +2401,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         state["tts_audio"] = stage_tts(
                             state["translated_text"],
                             state.get("vocals_path") or video_path,
-                            mm
+                            mm,
+                            target_language=config.target_language,
                         )
                     elif not state.get("translated_text"):
                         raise RuntimeError("No translated text available for TTS")

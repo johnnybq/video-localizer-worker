@@ -55,10 +55,31 @@ RUN git clone --depth 1 https://github.com/TencentARC/VideoPainter.git /opt/vide
 # Download VideoPainter checkpoints (context encoder + LoRA adapter)
 # Models are cached in /workspace/models for persistence across runs
 RUN mkdir -p /workspace/models/videopainter && \
-    git clone --depth 1 https://huggingface.co/TencentARC/VideoPainter /workspace/models/videopainter/checkpoints
+    git clone --depth 1 https://huggingface.co/TencentARC/VideoPainter /workspace/models/videopainter/checkpoints && \
+    echo "=== VideoPainter checkpoints structure ===" && \
+    ls -la /workspace/models/videopainter/checkpoints/ && \
+    echo "=== Branch (LoRA adapter) contents ===" && \
+    ls -la /workspace/models/videopainter/checkpoints/branch/ || echo "ERROR: branch directory not found!"
 
 # CogVideoX-5b-I2V base model will be downloaded on first run via HF cache
 # (too large for Docker image — ~20GB)
+
+# ==============================================================================
+# Phase 2b: ProPainter — fallback inpainting when VideoPainter fails
+# ==============================================================================
+# E2FGVI-based video inpainting, used as fallback before Replicate API
+RUN git clone --depth 1 https://github.com/sczhou/ProPainter.git /models/ProPainter && \
+    cd /models/ProPainter && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Download ProPainter model weights (~500MB total)
+RUN mkdir -p /models/ProPainter/weights && \
+    curl -L -o /models/ProPainter/weights/ProPainter.pth \
+        "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth" && \
+    curl -L -o /models/ProPainter/weights/recurrent_flow_completion.pth \
+        "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth" && \
+    curl -L -o /models/ProPainter/weights/raft-things.pth \
+        "https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth"
 
 # ==============================================================================
 # Phase 3: Pre-download GFPGAN model (enhance stage)
@@ -72,6 +93,7 @@ RUN mkdir -p /models/gfpgan && \
 # ==============================================================================
 RUN python3 -c "\
 import sys; \
+import os; \
 print(f'Python {sys.version}'); \
 import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}'); \
 from paddleocr import PaddleOCR; print('paddleocr OK'); \
@@ -83,7 +105,12 @@ import kornia; print('kornia OK'); \
 from peft import PeftModel; print('peft OK'); \
 import pyiqa; print('pyiqa OK'); \
 from f5_tts.api import F5TTS; print('f5-tts OK'); \
-from diffusers.pipelines.cogvideo import CogVideoXI2VInpaintAnyLPipeline; print('CogVideoXI2VInpaintAnyLPipeline OK'); \
+sys.path.insert(0, '/opt/videopainter'); \
+from diffusers.pipelines.cogvideo import CogVideoXI2VInpaintAnyLPipeline; print('VideoPainter pipeline OK'); \
+branch_path = '/workspace/models/videopainter/checkpoints/branch'; \
+assert os.path.exists(branch_path), f'CRITICAL: VideoPainter branch not found at {branch_path}'; \
+print(f'VideoPainter branch OK: {os.listdir(branch_path)[:5]}'); \
+assert os.path.exists('/models/ProPainter/inference_propainter.py'), 'ProPainter not found'; print('ProPainter OK'); \
 print('All critical imports verified.') \
 "
 
