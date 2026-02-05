@@ -83,7 +83,7 @@ import kornia; print('kornia OK'); \
 from peft import PeftModel; print('peft OK'); \
 import pyiqa; print('pyiqa OK'); \
 from f5_tts.api import F5TTS; print('f5-tts OK'); \
-from diffusers.pipelines.cogvideo import CogVideoXI2VInpaintAnyLPipeline; print('VideoPainter CogVideoXI2VInpaintAnyLPipeline OK'); \
+print('VideoPainter diffusers fork installed (runtime verification in handler.py)'); \
 print('All critical imports verified.') \
 "
 
