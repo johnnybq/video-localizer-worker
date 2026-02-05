@@ -59,7 +59,7 @@ RUN mkdir -p /workspace/models/videopainter && \
     echo "=== VideoPainter checkpoints structure ===" && \
     ls -la /workspace/models/videopainter/checkpoints/ && \
     echo "=== Branch (LoRA adapter) contents ===" && \
-    ls -la /workspace/models/videopainter/checkpoints/branch/ || echo "ERROR: branch directory not found!"
+    ls -la /workspace/models/videopainter/checkpoints/VideoPainter/checkpoints/branch/ || echo "ERROR: branch directory not found!"
 
 # CogVideoX-5b-I2V base model will be downloaded on first run via HF cache
 # (too large for Docker image — ~20GB)
@@ -110,7 +110,7 @@ import pyiqa; print('pyiqa OK'); \
 from f5_tts.api import F5TTS; print('f5-tts OK'); \
 sys.path.insert(0, '/opt/videopainter'); \
 from diffusers.pipelines.cogvideo import CogVideoXI2VInpaintAnyLPipeline; print('VideoPainter pipeline OK'); \
-branch_path = '/workspace/models/videopainter/checkpoints/branch'; \
+branch_path = '/workspace/models/videopainter/checkpoints/VideoPainter/checkpoints/branch'; \
 assert os.path.exists(branch_path), f'CRITICAL: VideoPainter branch not found at {branch_path}'; \
 print(f'VideoPainter branch OK: {os.listdir(branch_path)[:5]}'); \
 assert os.path.exists('/models/ProPainter/inference_propainter.py'), 'ProPainter not found'; print('ProPainter OK'); \

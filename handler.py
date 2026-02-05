@@ -195,7 +195,8 @@ def diagnose_videopainter() -> Dict[str, Any]:
         logger.warning(f"✗ VIDEOPAINTER_CKPT not found: {vp_ckpt}")
 
     # Check branch directory (LoRA adapter) - CRITICAL for inpainting quality!
-    branch_path = os.path.join(vp_ckpt, "branch")
+    # HF repo structure: checkpoints/VideoPainter/checkpoints/branch
+    branch_path = os.path.join(vp_ckpt, "VideoPainter", "checkpoints", "branch")
     if os.path.exists(branch_path):
         results["videopainter_branch"] = True
         logger.info(f"✓ VideoPainter branch (LoRA) exists: {branch_path}")
@@ -461,8 +462,8 @@ class ModelManager:
             else:
                 logger.info(f"VideoPainter: Using cached CogVideoX model at {model_path}")
 
-            # vp_ckpt already ends with "/checkpoints", so just add "branch"
-            branch_path = os.path.join(vp_ckpt, "branch")
+            # HF repo structure: checkpoints/VideoPainter/checkpoints/branch
+            branch_path = os.path.join(vp_ckpt, "VideoPainter", "checkpoints", "branch")
 
             # Check if branch (LoRA adapter) exists
             if os.path.exists(branch_path):
