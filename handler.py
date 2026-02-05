@@ -1000,11 +1000,11 @@ def _find_overlay_bbox(
     SOTA ASS Logic 3.0 — Smart matching:
     1. TIME FILTERING: Only consider detections within overlay's time window
     2. Fuzzy text match (Levenshtein > 60%) → use that exact bbox
-    3. Zone filtering with wider thresholds:
-       - top:    bbox entirely in y < 0.35
-       - bottom: bbox entirely in y > 0.65
-       - middle: bbox overlaps 0.35-0.65
-    4. Cluster nearby detections, don't union entire zone
+    3. Zone filtering with thresholds:
+       - top:    bbox entirely in y < 0.40
+       - bottom: bbox entirely in y > 0.60
+       - middle: bbox overlaps 0.40-0.60
+    4. Cluster nearby detections (vertical + horizontal proximity)
     5. Reduced minimum sizes (25% width, not 50%)
 
     Returns (x, y, w, h) in pixels.
@@ -1078,9 +1078,9 @@ def _find_overlay_bbox(
             return (x, y, w, h)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # STEP 2: Zone filtering with wider thresholds (bbox range, not center)
+    # STEP 2: Zone filtering (bbox y_min/y_max range, not just center)
     # ═══════════════════════════════════════════════════════════════════════
-    # Zone thresholds: top < 0.35, middle 0.35-0.65, bottom > 0.65
+    # Zone thresholds: top < 0.40, middle 0.40-0.60, bottom > 0.60
     filtered = []
     for d in text_detections:
         bbox = d.get("bbox_norm", [0, 0, 1, 1])
@@ -1093,15 +1093,15 @@ def _find_overlay_bbox(
         elif position == "bottom" and y_top > 0.60:  # Entire bbox in bottom 40%
             filtered.append(d)
         elif position in ("middle", "center"):
-            # Any overlap with middle zone
-            if y_top < 0.65 and y_bottom > 0.35:
+            # Any overlap with middle zone (0.40-0.60)
+            if y_top < 0.60 and y_bottom > 0.40:
                 filtered.append(d)
 
     logger.info(f"RENDER_TEXT: Zone-filtered {len(filtered)} detections for '{position}'")
 
     if filtered:
         # ═══════════════════════════════════════════════════════════════════
-        # STEP 3: Cluster nearby detections (don't union far-apart boxes)
+        # STEP 3: Cluster nearby detections (vertical + horizontal proximity)
         # ═══════════════════════════════════════════════════════════════════
         # Sort by confidence (if available) and take best cluster
         filtered.sort(key=lambda d: d.get("confidence", 0.5), reverse=True)
@@ -1110,16 +1110,27 @@ def _find_overlay_bbox(
         main_bbox = filtered[0].get("bbox_norm", [0, 0, 1, 1])
         cluster_bboxes = [main_bbox]
 
-        # Add nearby detections (within 20% vertical distance)
+        # Add nearby detections (both vertical AND horizontal proximity)
         for d in filtered[1:]:
             bbox = d.get("bbox_norm", [0, 0, 1, 1])
-            # Check if vertically close to main cluster
+
+            # Calculate cluster center
+            cluster_x_center = sum(b[0] + b[2] for b in cluster_bboxes) / (2 * len(cluster_bboxes))
             cluster_y_center = sum(b[1] + b[3] for b in cluster_bboxes) / (2 * len(cluster_bboxes))
+
+            det_x_center = (bbox[0] + bbox[2]) / 2
             det_y_center = (bbox[1] + bbox[3]) / 2
-            if abs(det_y_center - cluster_y_center) < 0.15:  # Within 15% vertical
+
+            # Check BOTH vertical AND horizontal proximity
+            # Vertical: within 12% of video height
+            # Horizontal: within 40% of video width (text blocks are often wide)
+            vert_close = abs(det_y_center - cluster_y_center) < 0.12
+            horiz_close = abs(det_x_center - cluster_x_center) < 0.40
+
+            if vert_close and horiz_close:
                 cluster_bboxes.append(bbox)
 
-        logger.info(f"RENDER_TEXT: Clustered {len(cluster_bboxes)} nearby detections")
+        logger.info(f"RENDER_TEXT: Clustered {len(cluster_bboxes)} nearby detections (of {len(filtered)} filtered)")
 
         # Union of clustered bboxes
         x_min = min(b[0] for b in cluster_bboxes)
@@ -1373,12 +1384,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # EVENT 1: ERASER PLATE (Layer 0)
         # ═══════════════════════════════════════════════════════════════
         # Draw solid rectangle using ASS vector drawing commands
-        # Padding: 15px around detected text bbox
-        pad = 15
-        plate_x1 = max(0, x - pad)
-        plate_y1 = max(0, y - pad)
-        plate_x2 = min(video_width, x + box_w + pad)
-        plate_y2 = min(video_height, y + box_h + pad)
+        # Relative padding: 8% of bbox width, 15% of bbox height (scales with resolution)
+        pad_x = max(8, int(box_w * 0.08))  # min 8px to avoid tiny plates
+        pad_y = max(6, int(box_h * 0.15))  # min 6px
+        plate_x1 = max(0, x - pad_x)
+        plate_y1 = max(0, y - pad_y)
+        plate_x2 = min(video_width, x + box_w + pad_x)
+        plate_y2 = min(video_height, y + box_h + pad_y)
 
         # ASS drawing: m = move, l = line
         # Rectangle: move to top-left, line to each corner
@@ -1390,9 +1402,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         )
 
         # {\p1} enables drawing mode, {\c&HBBGGRR&} sets fill color
+        # Use eraser_color (black when inpaint failed, gray otherwise)
         plate_event = (
             f"Dialogue: 0,{start_time},{end_time},EraserPlate,,0,0,0,,"
-            f"{{\\p1\\c&H00202020&\\1a&H00&}}{plate_drawing}"
+            f"{{\\p1\\c{eraser_color}&\\1a&H00&}}{plate_drawing}"
         )
         ass_content += plate_event + "\n"
 
