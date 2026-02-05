@@ -1006,7 +1006,16 @@ def _find_overlay_bbox(
             logger.info(f"RENDER_TEXT: FINAL bbox for '{position}': ({x}, {y}, {w}x{h})")
             return (x, y, w, h)
 
-    # Fallback: position-based defaults
+    # Fallback: position-based defaults for top/bottom ONLY
+    # Skip middle/center — no reliable fallback, and eraser plate would cover content
+    if position in ("middle", "center"):
+        logger.warning(
+            f"RENDER_TEXT: No OCR detections in zone '{position}' — skipping eraser plate "
+            f"for '{original_text[:30]}...' (would obscure video content)"
+        )
+        # Return minimal invisible box — text will render but no eraser
+        return (0, 0, 1, 1)
+
     logger.warning(f"RENDER_TEXT: No detections in zone '{position}'! Using fallback for '{original_text[:30]}...'")
 
     margin = int(video_width * 0.03)
@@ -1015,10 +1024,8 @@ def _find_overlay_bbox(
 
     if position == "top":
         y = int(video_height * 0.02)
-    elif position == "bottom":
+    else:  # bottom
         y = int(video_height * 0.83)
-    else:
-        y = int(video_height * 0.44)
 
     return (margin, y, box_w, box_h)
 
@@ -1164,11 +1171,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             overlay, text_detections, video_width, video_height
         )
 
-        # NO safe zone adjustment — place EXACTLY over original text!
-
         # Format times
         start_time = _format_ass_time(appears_at)
         end_time = _format_ass_time(disappears_at)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Skip entire overlay if no valid bbox (middle/center zone without OCR)
+        # ═══════════════════════════════════════════════════════════════
+        # Minimal bbox (0,0,1,1) means "skip this overlay entirely"
+        if x == 0 and y == 0 and box_w == 1 and box_h == 1:
+            logger.info(
+                f"RENDER_TEXT ASS [{i}]: skipping overlay for middle/center zone "
+                f"(no OCR detections, would obscure content)"
+            )
+            continue
 
         # ═══════════════════════════════════════════════════════════════
         # EVENT 1: ERASER PLATE (Layer 0)
