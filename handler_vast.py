@@ -42,7 +42,7 @@ PROGRESS_URL = f"{BACKEND_URL}/api/sota/worker/progress"
 
 WORKER_ID = os.environ.get("WORKER_ID", f"vast-{uuid.uuid4().hex[:8]}")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))         # seconds between polls
-IDLE_SHUTDOWN_SECS = int(os.environ.get("IDLE_SHUTDOWN", "600"))  # shutdown after N idle seconds
+IDLE_SHUTDOWN_SECS = int(os.environ.get("IDLE_SHUTDOWN", "3600"))  # shutdown after N idle seconds (1 hour default)
 
 # =============================================================================
 # Import Handler Logic

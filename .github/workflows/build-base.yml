@@ -24,15 +24,27 @@ jobs:
         run: |
           echo "Before cleanup:"
           df -h
+          # Remove large unused tools
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/graalvm
+          sudo rm -rf /usr/local/.ghcup
+          # Clean docker
           sudo docker system prune -af
+          sudo docker builder prune -af
+          # Add swap for extra memory during large installs
+          sudo fallocate -l 8G /swapfile || true
+          sudo chmod 600 /swapfile || true
+          sudo mkswap /swapfile || true
+          sudo swapon /swapfile || true
           echo "After cleanup:"
           df -h
+          free -h
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,8 +67,9 @@ jobs:
           tags: |
             johnnybq/video-localizer-base:${{ github.event.inputs.version }}
             ${{ github.event.inputs.push_latest == 'true' && 'johnnybq/video-localizer-base:latest' || '' }}
-          # No GHA cache for base — it's rebuilt rarely and needs full rebuild
-          # to ensure all dependencies are fresh
+          # Use Docker Hub registry as cache — layers pushed immediately, saves disk space
+          cache-from: type=registry,ref=johnnybq/video-localizer-base:buildcache
+          cache-to: type=registry,ref=johnnybq/video-localizer-base:buildcache,mode=max
 
       - name: Verify base image
         run: |
