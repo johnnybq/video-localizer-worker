@@ -11,6 +11,23 @@ jobs:
     timeout-minutes: 90  # Base image is ~25GB, allow plenty of time for slow runners
 
     steps:
+      - name: Free disk space
+        run: |
+          echo "Before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/graalvm
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+          sudo docker builder prune -af
+          echo "After cleanup:"
+          df -h
+
       - name: Checkout
         uses: actions/checkout@v4
 
