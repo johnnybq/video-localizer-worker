@@ -604,7 +604,8 @@ def stage_create_mask(video_path: str, detections: List[Dict], mm: ModelManager)
         # Convert polygon bbox to axis-aligned box [x_min, y_min, x_max, y_max]
         x_coords = [p[0] for p in bbox]
         y_coords = [p[1] for p in bbox]
-        box = np.array([min(x_coords), min(y_coords), max(x_coords), max(y_coords)])
+        # Use float32 dtype to match SAM2's internal BFloat16 (avoids dtype mismatch)
+        box = np.array([min(x_coords), min(y_coords), max(x_coords), max(y_coords)], dtype=np.float32)
 
         # Use BOX prompt (much better for text regions than center point)
         # SAM2 box format: [x1, y1, x2, y2] as np.array
@@ -625,8 +626,8 @@ def stage_create_mask(video_path: str, detections: List[Dict], mm: ModelManager)
                 inference_state=inference_state,
                 frame_idx=frame_idx,
                 obj_id=i,
-                points=np.array([[x_center, y_center]]),
-                labels=np.array([1])
+                points=np.array([[x_center, y_center]], dtype=np.float32),
+                labels=np.array([1], dtype=np.int32)
             )
 
     # Propagate masks through video
@@ -1034,7 +1035,7 @@ def _find_overlay_bbox(
     logger.info(f"RENDER_TEXT bbox: position='{position}', detections={len(text_detections)}, text='{original_text[:40]}...'")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # STEP 1: Fuzzy text matching (best method — exact bbox for matching text)
+    # STEP 1: Fuzzy text matching (WITH zone filtering to prevent center false positives)
     # ═══════════════════════════════════════════════════════════════════════
     if original_text and len(original_text) > 5:
         best_match = None
@@ -1043,6 +1044,23 @@ def _find_overlay_bbox(
             det_text = d.get("text", "")
             if not det_text:
                 continue
+
+            # ZONE FILTER: Only consider detections in the correct zone!
+            bbox = d.get("bbox_norm", [0, 0, 1, 1])
+            y_top = bbox[1]
+            y_bottom = bbox[3]
+
+            in_correct_zone = False
+            if position == "top" and y_bottom < 0.45:  # Allow slightly more tolerance
+                in_correct_zone = True
+            elif position == "bottom" and y_top > 0.55:
+                in_correct_zone = True
+            elif position in ("middle", "center") and y_top < 0.65 and y_bottom > 0.35:
+                in_correct_zone = True
+
+            if not in_correct_zone:
+                continue  # Skip detections outside the expected zone
+
             ratio = _levenshtein_ratio(original_text, det_text)
             # Also check if detection is substring of overlay or vice versa
             if original_text.lower() in det_text.lower() or det_text.lower() in original_text.lower():
