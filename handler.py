@@ -147,11 +147,11 @@ def diagnose_videopainter() -> Dict[str, Any]:
         if results["videopainter_root"]:
             import sys
             sys.path.insert(0, vp_root)
-        from diffusers.pipelines.cogvideo.pipeline_cogvideox_i2v_dual_inpaint_anyl import (
-            CogVideoXI2VDualInpaintAnyLPipeline,
+        from diffusers.pipelines.cogvideo.pipeline_cogvideox_inpainting_i2v_anyl import (
+            CogVideoXI2VInpaintAnyLPipeline,
         )
         results["custom_diffusers_pipeline"] = True
-        logger.info("✓ Custom diffusers pipeline (CogVideoXI2VDualInpaintAnyLPipeline) available")
+        logger.info("✓ Custom diffusers pipeline (CogVideoXI2VInpaintAnyLPipeline) available")
     except ImportError as e:
         results["errors"].append(f"Custom diffusers pipeline import failed: {e}")
         logger.warning(f"✗ Custom diffusers pipeline import failed: {e}")
@@ -354,14 +354,14 @@ class ModelManager:
 
         elif name == "videopainter":
             # VideoPainter (TencentARC) — proper mask-guided video inpainting
-            # Uses custom CogVideoXI2VDualInpaintAnyLPipeline from their diffusers fork
+            # Uses custom CogVideoXI2VInpaintAnyLPipeline from their diffusers fork
             vp_root = os.environ.get("VIDEOPAINTER_ROOT", "/opt/videopainter")
             vp_ckpt = os.environ.get("VIDEOPAINTER_CKPT", "/workspace/models/videopainter/checkpoints")
             sys.path.insert(0, vp_root)
 
             from diffusers import CogVideoXTransformer3DModel
-            from diffusers.pipelines.cogvideo.pipeline_cogvideox_i2v_dual_inpaint_anyl import (
-                CogVideoXI2VDualInpaintAnyLPipeline,
+            from diffusers.pipelines.cogvideo.pipeline_cogvideox_inpainting_i2v_anyl import (
+                CogVideoXI2VInpaintAnyLPipeline,
             )
 
             model_path = os.path.join(os.environ.get("HF_HOME", "/workspace/models/huggingface"),
@@ -375,7 +375,7 @@ class ModelManager:
             transformer = CogVideoXTransformer3DModel.from_pretrained(
                 model_path, subfolder="transformer", torch_dtype=torch.bfloat16
             )
-            pipe = CogVideoXI2VDualInpaintAnyLPipeline.from_pretrained(
+            pipe = CogVideoXI2VInpaintAnyLPipeline.from_pretrained(
                 model_path,
                 branch=branch_path if os.path.exists(branch_path) else None,
                 transformer=transformer,
