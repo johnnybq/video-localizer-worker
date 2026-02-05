@@ -26,9 +26,9 @@ jobs:
       - name: Check if base image exists
         id: check_base
         run: |
-          if docker manifest inspect johnnybq/video-localizer-base:v1 > /dev/null 2>&1; then
+          if docker manifest inspect johnnybq/video-localizer-base:v2 > /dev/null 2>&1; then
             echo "base_exists=true" >> $GITHUB_OUTPUT
-            echo "Base image found: johnnybq/video-localizer-base:v1"
+            echo "Base image found: johnnybq/video-localizer-base:v2"
           else
             echo "base_exists=false" >> $GITHUB_OUTPUT
             echo "WARNING: Base image not found, will use full Dockerfile"
