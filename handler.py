@@ -587,22 +587,47 @@ def stage_create_mask(video_path: str, detections: List[Dict], mm: ModelManager)
     # Initialize video predictor
     inference_state = sam2.init_state(video_path)
 
-    # Add prompts for each text region
-    for i, det in enumerate(detections[:10]):  # Limit to 10 regions
+    # Sort detections by confidence (best first) and filter low-confidence
+    sorted_dets = sorted(
+        [d for d in detections if d.get("confidence", 0.5) >= 0.3],
+        key=lambda d: d.get("confidence", 0.5),
+        reverse=True
+    )
+    logger.info(f"CREATE_MASK: {len(detections)} total, {len(sorted_dets)} after confidence filter")
+
+    # Add prompts for each text region (top 15 by confidence)
+    for i, det in enumerate(sorted_dets[:15]):
         frame_idx = det["frame_idx"]
-        bbox = det["bbox"]
+        bbox = det["bbox"]  # List of 4 points: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        confidence = det.get("confidence", 0.5)
 
-        # Use center point as prompt
-        x_center = sum(p[0] for p in bbox) / 4
-        y_center = sum(p[1] for p in bbox) / 4
+        # Convert polygon bbox to axis-aligned box [x_min, y_min, x_max, y_max]
+        x_coords = [p[0] for p in bbox]
+        y_coords = [p[1] for p in bbox]
+        box = np.array([min(x_coords), min(y_coords), max(x_coords), max(y_coords)])
 
-        sam2.add_new_points_or_box(
-            inference_state=inference_state,
-            frame_idx=frame_idx,
-            obj_id=i,
-            points=np.array([[x_center, y_center]]),
-            labels=np.array([1])
-        )
+        # Use BOX prompt (much better for text regions than center point)
+        # SAM2 box format: [x1, y1, x2, y2] as np.array
+        try:
+            sam2.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                obj_id=i,
+                box=box  # Use box prompt instead of single point
+            )
+            logger.debug(f"CREATE_MASK: Added box prompt #{i} conf={confidence:.2f} box={box.tolist()}")
+        except Exception as e:
+            # Fallback to center point if box prompt fails
+            logger.warning(f"CREATE_MASK: Box prompt failed, using center point: {e}")
+            x_center = sum(p[0] for p in bbox) / 4
+            y_center = sum(p[1] for p in bbox) / 4
+            sam2.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                obj_id=i,
+                points=np.array([[x_center, y_center]]),
+                labels=np.array([1])
+            )
 
     # Propagate masks through video
     mask_frames = {}
@@ -624,7 +649,7 @@ def stage_create_mask(video_path: str, detections: List[Dict], mm: ModelManager)
 
 
 def _render_mask_video(video_path: str, masks: Dict[int, np.ndarray], output_path: str):
-    """Render mask frames to video."""
+    """Render mask frames to video with nearest-neighbor interpolation."""
     import cv2
 
     cap = cv2.VideoCapture(video_path)
@@ -636,31 +661,50 @@ def _render_mask_video(video_path: str, masks: Dict[int, np.ndarray], output_pat
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height), isColor=False)
 
+    # Pre-compute sorted frame indices for nearest-neighbor lookup
+    mask_frames = sorted(masks.keys())
+    logger.info(f"MASK_VIDEO: Rendering {frame_count} frames, {len(mask_frames)} keyframes")
+
     for i in range(frame_count):
         if i in masks:
             mask = cv2.resize(masks[i], (width, height))
+        elif mask_frames:
+            # Nearest-neighbor interpolation (not zeros!)
+            # Find closest keyframe
+            nearest_idx = min(mask_frames, key=lambda x: abs(x - i))
+            # Only use if within reasonable distance (30 frames = ~1 sec)
+            if abs(nearest_idx - i) <= 30:
+                mask = cv2.resize(masks[nearest_idx], (width, height))
+            else:
+                # Too far from any keyframe - no text expected here
+                mask = np.zeros((height, width), dtype=np.uint8)
         else:
-            # Interpolate from nearest frames
             mask = np.zeros((height, width), dtype=np.uint8)
 
         out.write(mask)
 
     cap.release()
     out.release()
+    logger.info(f"MASK_VIDEO: Saved to {output_path}")
 
 
-def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Optional[List[str]] = None) -> str:
+def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Optional[List[str]] = None) -> Tuple[str, bool]:
     """
     Remove text using VideoPainter (primary) or ProPainter (fallback).
 
     Args:
         errors: Optional list to append error messages (for metrics tracking)
+
+    Returns:
+        Tuple of (video_path, inpaint_succeeded)
+        - inpaint_succeeded=True: Text was removed, eraser plate optional
+        - inpaint_succeeded=False: Text NOT removed, eraser plate REQUIRED
     """
     logger.info("Stage: INPAINT")
 
     if mask_path is None:
         logger.info("No mask, skipping inpainting")
-        return video_path
+        return video_path, True  # No text to remove = "success"
 
     output_path = video_path.replace(".mp4", "_inpainted.mp4")
     all_errors = []
@@ -671,7 +715,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         with mm.use("videopainter") as videopainter:
             result = _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
             logger.info("INPAINT: VideoPainter succeeded!")
-            return result
+            return result, True
     except Exception as e:
         import traceback
         err_msg = f"VideoPainter failed: {e}"
@@ -684,7 +728,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         logger.info("INPAINT: Attempting ProPainter fallback...")
         result = _inpaint_propainter(video_path, mask_path, output_path)
         logger.info("INPAINT: ProPainter succeeded!")
-        return result
+        return result, True
     except Exception as e:
         import traceback
         err_msg = f"ProPainter failed: {e}"
@@ -692,14 +736,15 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         logger.debug(f"ProPainter traceback:\n{traceback.format_exc()}")
         all_errors.append(err_msg)
 
-    # All methods failed - log to errors array
+    # All methods failed - eraser plate is now REQUIRED
     combined_error = f"inpaint: ALL methods failed - {'; '.join(all_errors)}"
     logger.error(combined_error)
+    logger.warning("INPAINT: Falling back to ERASER-PLATE-ONLY mode (original text NOT removed)")
     if errors is not None:
         errors.append(combined_error)
 
-    # Return original as last resort
-    return video_path
+    # Return original but signal that inpaint failed
+    return video_path, False
 
 
 def _inpaint_propainter(video_path: str, mask_path: str, output_path: str) -> str:
@@ -916,116 +961,239 @@ def _copy_audio(source_video: str, target_video: str):
     shutil.move(temp_output, target_video)
 
 
+def _levenshtein_ratio(s1: str, s2: str) -> float:
+    """Simple Levenshtein similarity ratio (0.0 - 1.0)."""
+    if not s1 or not s2:
+        return 0.0
+    s1, s2 = s1.lower().strip(), s2.lower().strip()
+    if s1 == s2:
+        return 1.0
+    len1, len2 = len(s1), len(s2)
+    if len1 == 0 or len2 == 0:
+        return 0.0
+    # Simple edit distance
+    dp = [[0] * (len2 + 1) for _ in range(len1 + 1)]
+    for i in range(len1 + 1):
+        dp[i][0] = i
+    for j in range(len2 + 1):
+        dp[0][j] = j
+    for i in range(1, len1 + 1):
+        for j in range(1, len2 + 1):
+            cost = 0 if s1[i - 1] == s2[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    distance = dp[len1][len2]
+    return 1.0 - (distance / max(len1, len2))
+
+
 def _find_overlay_bbox(
     overlay: Dict,
     text_detections: List[Dict],
     video_width: int,
     video_height: int,
+    appears_at: float = 0.0,
+    disappears_at: float = 0.0,
+    video_fps: float = 30.0,
 ) -> Tuple[int, int, int, int]:
     """
     Find pixel bounding box for an overlay based on OCR detections.
 
-    SOTA ASS Logic 2.0: Strict zone filtering
-    - top:    y_center < 0.45 (upper 45% of screen)
-    - bottom: y_center > 0.55 (lower 45% of screen)
-    - middle: 0.45 <= y_center <= 0.55
+    SOTA ASS Logic 3.0 — Smart matching:
+    1. TIME FILTERING: Only consider detections within overlay's time window
+    2. Fuzzy text match (Levenshtein > 60%) → use that exact bbox
+    3. Zone filtering with wider thresholds:
+       - top:    bbox entirely in y < 0.35
+       - bottom: bbox entirely in y > 0.65
+       - middle: bbox overlaps 0.35-0.65
+    4. Cluster nearby detections, don't union entire zone
+    5. Reduced minimum sizes (25% width, not 50%)
 
-    Returns (x, y, w, h) in pixels with generous padding.
+    Returns (x, y, w, h) in pixels.
     """
     position = overlay.get("position", "top")
-    original_text = overlay.get("text", "")[:40]
+    original_text = overlay.get("text", "")
 
-    # Log all detections for debugging
-    logger.info(f"RENDER_TEXT bbox: position='{position}', total_detections={len(text_detections)}")
-    for i, d in enumerate(text_detections[:8]):  # Log first 8
-        bbox = d.get("bbox_norm", [0, 0, 1, 1])
-        y_center = (bbox[1] + bbox[3]) / 2
-        text = d.get("text", "")[:25]
-        logger.info(f"  det[{i}]: y_center={y_center:.3f} bbox=[{bbox[0]:.2f},{bbox[1]:.2f},{bbox[2]:.2f},{bbox[3]:.2f}] '{text}'")
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 0: Time filtering — only consider detections in overlay's time window
+    # ═══════════════════════════════════════════════════════════════════════
+    if appears_at > 0 or disappears_at > 0:
+        # Convert time window to frame range (with margin)
+        margin_sec = 1.0  # 1 second margin
+        start_frame = max(0, int((appears_at - margin_sec) * video_fps))
+        end_frame = int((disappears_at + margin_sec) * video_fps)
 
-    # STRICT zone filtering by y_center
-    filtered = []
-    for d in text_detections:
-        bbox = d.get("bbox_norm", [0, 0, 1, 1])
-        y_center = (bbox[1] + bbox[3]) / 2
+        time_filtered = [
+            d for d in text_detections
+            if start_frame <= d.get("frame_idx", 0) <= end_frame
+        ]
+        logger.info(
+            f"RENDER_TEXT bbox: TIME FILTER {appears_at:.1f}s-{disappears_at:.1f}s "
+            f"(frames {start_frame}-{end_frame}): {len(text_detections)} → {len(time_filtered)} detections"
+        )
+        text_detections = time_filtered
 
-        if position == "top" and y_center < 0.45:
-            filtered.append(d)
-        elif position == "bottom" and y_center > 0.55:
-            filtered.append(d)
-        elif position in ("middle", "center") and 0.45 <= y_center <= 0.55:
-            filtered.append(d)
+    logger.info(f"RENDER_TEXT bbox: position='{position}', detections={len(text_detections)}, text='{original_text[:40]}...'")
 
-    logger.info(f"RENDER_TEXT: Filtered {len(filtered)} detections for zone '{position}'")
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 1: Fuzzy text matching (best method — exact bbox for matching text)
+    # ═══════════════════════════════════════════════════════════════════════
+    if original_text and len(original_text) > 5:
+        best_match = None
+        best_ratio = 0.0
+        for d in text_detections:
+            det_text = d.get("text", "")
+            if not det_text:
+                continue
+            ratio = _levenshtein_ratio(original_text, det_text)
+            # Also check if detection is substring of overlay or vice versa
+            if original_text.lower() in det_text.lower() or det_text.lower() in original_text.lower():
+                ratio = max(ratio, 0.7)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = d
 
-    if filtered:
-        bboxes = [d["bbox_norm"] for d in filtered if "bbox_norm" in d]
+        if best_match and best_ratio >= 0.6:
+            bbox = best_match.get("bbox_norm", [0, 0, 1, 1])
+            logger.info(f"RENDER_TEXT: Fuzzy match found! ratio={best_ratio:.2f} text='{best_match.get('text', '')[:30]}'")
 
-        if bboxes:
-            x_min = min(b[0] for b in bboxes)
-            y_min = min(b[1] for b in bboxes)
-            x_max = max(b[2] for b in bboxes)
-            y_max = max(b[3] for b in bboxes)
+            # Small padding around matched text (3% relative)
+            pad_x = (bbox[2] - bbox[0]) * 0.15  # 15% of bbox width
+            pad_y = (bbox[3] - bbox[1]) * 0.2   # 20% of bbox height
 
-            logger.info(f"RENDER_TEXT: Zone '{position}' raw bbox: x=[{x_min:.3f},{x_max:.3f}] y=[{y_min:.3f},{y_max:.3f}]")
+            x_min = max(0, bbox[0] - pad_x)
+            y_min = max(0, bbox[1] - pad_y)
+            x_max = min(1.0, bbox[2] + pad_x)
+            y_max = min(1.0, bbox[3] + pad_y)
 
-            # GENEROUS padding to fully cover original text + background
-            pad_x = 0.02  # 2% horizontal
-            pad_y = 0.015  # 1.5% vertical
-
-            x_min = max(0, x_min - pad_x)
-            y_min = max(0, y_min - pad_y)
-            x_max = min(1.0, x_max + pad_x)
-            y_max = min(1.0, y_max + pad_y)
-
-            # Convert to pixels
             x = int(x_min * video_width)
             y = int(y_min * video_height)
             w = int((x_max - x_min) * video_width)
             h = int((y_max - y_min) * video_height)
 
-            # Minimum dimensions for readability
-            min_w = int(video_width * 0.5)  # At least 50% width
-            min_h = int(video_height * 0.06)  # At least 6% height
-
-            if w < min_w:
-                expand = (min_w - w) // 2
-                x = max(0, x - expand)
-                w = min_w
+            # Minimum height for readability (4% of video)
+            min_h = int(video_height * 0.04)
             if h < min_h:
                 h = min_h
 
-            # Keep within screen bounds
-            if x + w > video_width:
-                x = video_width - w
-            if y + h > video_height:
-                y = video_height - h
-            x = max(0, x)
-            y = max(0, y)
-
-            logger.info(f"RENDER_TEXT: FINAL bbox for '{position}': ({x}, {y}, {w}x{h})")
+            logger.info(f"RENDER_TEXT: FUZZY MATCH bbox: ({x}, {y}, {w}x{h})")
             return (x, y, w, h)
 
-    # Fallback: position-based defaults for top/bottom ONLY
-    # Skip middle/center — no reliable fallback, and eraser plate would cover content
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 2: Zone filtering with wider thresholds (bbox range, not center)
+    # ═══════════════════════════════════════════════════════════════════════
+    # Zone thresholds: top < 0.35, middle 0.35-0.65, bottom > 0.65
+    filtered = []
+    for d in text_detections:
+        bbox = d.get("bbox_norm", [0, 0, 1, 1])
+        y_top = bbox[1]     # Top edge of detection
+        y_bottom = bbox[3]  # Bottom edge of detection
+
+        # Check if bbox is ENTIRELY within zone (not just center)
+        if position == "top" and y_bottom < 0.40:  # Entire bbox in top 40%
+            filtered.append(d)
+        elif position == "bottom" and y_top > 0.60:  # Entire bbox in bottom 40%
+            filtered.append(d)
+        elif position in ("middle", "center"):
+            # Any overlap with middle zone
+            if y_top < 0.65 and y_bottom > 0.35:
+                filtered.append(d)
+
+    logger.info(f"RENDER_TEXT: Zone-filtered {len(filtered)} detections for '{position}'")
+
+    if filtered:
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 3: Cluster nearby detections (don't union far-apart boxes)
+        # ═══════════════════════════════════════════════════════════════════
+        # Sort by confidence (if available) and take best cluster
+        filtered.sort(key=lambda d: d.get("confidence", 0.5), reverse=True)
+
+        # Start with highest-confidence detection
+        main_bbox = filtered[0].get("bbox_norm", [0, 0, 1, 1])
+        cluster_bboxes = [main_bbox]
+
+        # Add nearby detections (within 20% vertical distance)
+        for d in filtered[1:]:
+            bbox = d.get("bbox_norm", [0, 0, 1, 1])
+            # Check if vertically close to main cluster
+            cluster_y_center = sum(b[1] + b[3] for b in cluster_bboxes) / (2 * len(cluster_bboxes))
+            det_y_center = (bbox[1] + bbox[3]) / 2
+            if abs(det_y_center - cluster_y_center) < 0.15:  # Within 15% vertical
+                cluster_bboxes.append(bbox)
+
+        logger.info(f"RENDER_TEXT: Clustered {len(cluster_bboxes)} nearby detections")
+
+        # Union of clustered bboxes
+        x_min = min(b[0] for b in cluster_bboxes)
+        y_min = min(b[1] for b in cluster_bboxes)
+        x_max = max(b[2] for b in cluster_bboxes)
+        y_max = max(b[3] for b in cluster_bboxes)
+
+        # Relative padding (5% of bbox dimensions)
+        bbox_w = x_max - x_min
+        bbox_h = y_max - y_min
+        pad_x = bbox_w * 0.08
+        pad_y = bbox_h * 0.15
+
+        x_min = max(0, x_min - pad_x)
+        y_min = max(0, y_min - pad_y)
+        x_max = min(1.0, x_max + pad_x)
+        y_max = min(1.0, y_max + pad_y)
+
+        # Convert to pixels
+        x = int(x_min * video_width)
+        y = int(y_min * video_height)
+        w = int((x_max - x_min) * video_width)
+        h = int((y_max - y_min) * video_height)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 4: Reduced minimum sizes (25% width, 4% height)
+        # ═══════════════════════════════════════════════════════════════════
+        min_w = int(video_width * 0.25)  # Reduced from 50%
+        min_h = int(video_height * 0.04)  # Reduced from 6%
+
+        if w < min_w:
+            expand = (min_w - w) // 2
+            x = max(0, x - expand)
+            w = min_w
+        if h < min_h:
+            h = min_h
+
+        # Safety: max 90% width to avoid edge issues
+        max_w = int(video_width * 0.90)
+        if w > max_w:
+            x = int((video_width - max_w) / 2)
+            w = max_w
+
+        # Keep within screen bounds
+        if x + w > video_width:
+            x = video_width - w
+        if y + h > video_height:
+            y = video_height - h
+        x = max(0, x)
+        y = max(0, y)
+
+        logger.info(f"RENDER_TEXT: CLUSTERED bbox for '{position}': ({x}, {y}, {w}x{h})")
+        return (x, y, w, h)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 5: Fallback for top/bottom (skip middle/center entirely)
+    # ═══════════════════════════════════════════════════════════════════════
     if position in ("middle", "center"):
         logger.warning(
-            f"RENDER_TEXT: No OCR detections in zone '{position}' — skipping eraser plate "
-            f"for '{original_text[:30]}...' (would obscure video content)"
+            f"RENDER_TEXT: No OCR in zone '{position}' — skipping (would obscure content)"
         )
-        # Return minimal invisible box — text will render but no eraser
-        return (0, 0, 1, 1)
+        return (0, 0, 1, 1)  # Signal to skip this overlay
 
-    logger.warning(f"RENDER_TEXT: No detections in zone '{position}'! Using fallback for '{original_text[:30]}...'")
+    logger.warning(f"RENDER_TEXT: No detections, using position fallback for '{original_text[:30]}...'")
 
-    margin = int(video_width * 0.03)
-    box_w = int(video_width * 0.94)
-    box_h = int(video_height * 0.12)
+    # Narrower fallback box (70% width instead of 94%)
+    margin = int(video_width * 0.15)
+    box_w = int(video_width * 0.70)
+    box_h = int(video_height * 0.08)
 
     if position == "top":
-        y = int(video_height * 0.02)
+        y = int(video_height * 0.03)
     else:  # bottom
-        y = int(video_height * 0.83)
+        y = int(video_height * 0.85)
 
     return (margin, y, box_w, box_h)
 
@@ -1114,10 +1282,12 @@ def _generate_ass_subtitles(
     video_width: int,
     video_height: int,
     video_duration: float,
+    video_fps: float,
     subtitle_style: Optional[Dict] = None,
+    inpaint_succeeded: bool = True,
 ) -> str:
     """
-    Generate ASS subtitle file with SOTA Logic 2.0.
+    Generate ASS subtitle file with SOTA Logic 3.0.
 
     Strategy: "Eraser Plate + Text" — two events per overlay:
     1. Layer 0: Dark plate covering original text (eraser)
@@ -1128,11 +1298,21 @@ def _generate_ass_subtitles(
     # Font size: ~3.2% of video height for mobile readability
     font_size = int(video_height * 0.032)
 
+    # Eraser plate color: FULLY OPAQUE BLACK when inpaint failed, dark gray otherwise
+    # ASS format: &HAABBGGRR where AA=alpha (00=opaque, FF=transparent)
+    if inpaint_succeeded:
+        # Inpaint worked — eraser plate is just a subtle background
+        eraser_color = "&H00202020"  # Dark gray, slightly transparent feel
+    else:
+        # Inpaint FAILED — eraser plate MUST cover original text completely
+        eraser_color = "&H00000000"  # Pure black, fully opaque
+        logger.info("ASS: Using FULLY OPAQUE BLACK eraser plates (inpaint failed)")
+
     # ASS Header with two styles:
-    # - EraserPlate: solid dark background to cover original
+    # - EraserPlate: solid background to cover original text
     # - TranslatedText: white text with thin outline
     ass_content = f"""[Script Info]
-Title: TrafficPlant SOTA Subtitles v2
+Title: TrafficPlant SOTA Subtitles v3
 ScriptType: v4.00+
 WrapStyle: 0
 PlayResX: {video_width}
@@ -1141,14 +1321,14 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: EraserPlate,Arial,20,&H00202020,&H00202020,&H00202020,&H00202020,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
+Style: EraserPlate,Arial,20,{eraser_color},{eraser_color},{eraser_color},{eraser_color},0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
 Style: TranslatedText,Noto Sans,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.5,1,5,10,10,10,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     # Style breakdown:
-    # EraserPlate: PrimaryColour=&H00202020 (dark gray), BorderStyle=1, no outline/shadow
+    # EraserPlate: solid color plate, BorderStyle=1, no outline/shadow
     # TranslatedText: PrimaryColour=&H00FFFFFF (white BGR), Bold=0, Outline=1.5, Shadow=1
 
     for i, overlay in enumerate(translated_overlays):
@@ -1160,15 +1340,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         disappears_at = overlay.get("disappears_at", 0.0)
         position = overlay.get("position", "top")
 
-        # Extend to video end if needed
-        if disappears_at < video_duration - 0.5:
+        # Only extend to video end if Gemini didn't provide disappears_at (0 or missing)
+        # DO NOT extend short overlays — they should disappear when the original text does
+        if disappears_at <= 0:
             disappears_at = video_duration
+        # Safety: ensure at least 2s display time if times are nonsensical
         if disappears_at <= appears_at:
-            disappears_at = appears_at + 5.0
+            disappears_at = appears_at + 2.0
 
-        # Get bounding box from OCR (zone-filtered)
+        # Get bounding box from OCR (zone + time filtered)
         x, y, box_w, box_h = _find_overlay_bbox(
-            overlay, text_detections, video_width, video_height
+            overlay, text_detections, video_width, video_height,
+            appears_at=appears_at, disappears_at=disappears_at, video_fps=video_fps
         )
 
         # Format times
@@ -1251,6 +1434,7 @@ def stage_render_text(
     resolution: Tuple[int, int],
     fps: float,
     subtitle_style: Optional[Dict] = None,
+    inpaint_succeeded: bool = True,
 ) -> str:
     """
     Render translated text overlays onto video using ASS subtitles.
@@ -1262,9 +1446,13 @@ def stage_render_text(
     - Smart word-wrapping (~25 chars per line for mobile)
     - Safe zone awareness (avoid TikTok UI elements)
 
+    When inpaint_succeeded=False, eraser plates use fully opaque black
+    to ensure original text is covered.
+
     Zero VRAM — pure CPU/ffmpeg.
     """
-    logger.info(f"Stage: RENDER_TEXT ASS ({len(translated_overlays)} overlays)")
+    mode = "ERASER-PLATE-REQUIRED" if not inpaint_succeeded else "normal"
+    logger.info(f"Stage: RENDER_TEXT ASS ({len(translated_overlays)} overlays, mode={mode})")
 
     if not translated_overlays:
         logger.info("No overlays to render, skipping")
@@ -1289,7 +1477,9 @@ def stage_render_text(
         video_width=video_width,
         video_height=video_height,
         video_duration=video_duration,
+        video_fps=video_fps,
         subtitle_style=subtitle_style,
+        inpaint_succeeded=inpaint_succeeded,
     )
 
     # Write ASS file to temp location
@@ -1924,12 +2114,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     )
 
                 elif stage_name == "inpaint":
-                    state["video_path"] = stage_inpaint(
+                    video_path, inpaint_ok = stage_inpaint(
                         state["video_path"],
                         state["mask_path"],
                         mm,
                         errors=metrics.errors  # Track inpaint failures
                     )
+                    state["video_path"] = video_path
+                    state["inpaint_succeeded"] = inpaint_ok
 
                 elif stage_name == "render_text":
                     if config.translated_overlays:
@@ -1940,6 +2132,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                             state.get("text_resolution", (1920, 1080)),
                             state.get("text_fps", 30.0),
                             config.subtitle_style,
+                            inpaint_succeeded=state.get("inpaint_succeeded", True),
                         )
                     else:
                         logger.info("RENDER_TEXT: No translated overlays provided, skipping")
