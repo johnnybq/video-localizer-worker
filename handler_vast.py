@@ -45,6 +45,43 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))         # seconds betw
 IDLE_SHUTDOWN_SECS = int(os.environ.get("IDLE_SHUTDOWN", "3600"))  # shutdown after N idle seconds (1 hour default)
 
 # =============================================================================
+# Model Preloading
+# =============================================================================
+
+def preload_models():
+    """
+    Preload large models before accepting tasks.
+    CogVideoX-5b-I2V is ~20GB and must be downloaded on first run.
+    """
+    import os
+
+    # CogVideoX for VideoPainter
+    hf_home = os.environ.get("HF_HOME", "/workspace/models/huggingface")
+    cogvideo_path = os.path.join(hf_home, "hub", "models--THUDM--CogVideoX-5b-I2V")
+    cogvideo_alt_path = os.path.join(hf_home, "THUDM/CogVideoX-5b-I2V")
+
+    if os.path.exists(cogvideo_path) or os.path.exists(cogvideo_alt_path):
+        log.info(f"✓ CogVideoX-5b-I2V already cached")
+    else:
+        log.info("=" * 60)
+        log.info("Preloading CogVideoX-5b-I2V (~20GB)...")
+        log.info("This is required for VideoPainter inpainting.")
+        log.info("=" * 60)
+
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                "THUDM/CogVideoX-5b-I2V",
+                cache_dir=hf_home,
+                resume_download=True,
+            )
+            log.info("✓ CogVideoX-5b-I2V preloaded successfully!")
+        except Exception as e:
+            log.warning(f"⚠ CogVideoX preload failed: {e}")
+            log.warning("VideoPainter may fail, ProPainter fallback will be used.")
+
+
+# =============================================================================
 # Import Handler Logic
 # =============================================================================
 
@@ -284,4 +321,5 @@ def main():
 
 
 if __name__ == "__main__":
+    preload_models()
     main()
