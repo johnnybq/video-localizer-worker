@@ -147,7 +147,7 @@ def diagnose_videopainter() -> Dict[str, Any]:
         if results["videopainter_root"]:
             import sys
             sys.path.insert(0, vp_root)
-        from diffusers.pipelines.cogvideo.pipeline_cogvideox_inpainting_i2v_anyl import (
+        from diffusers.pipelines.cogvideo import (
             CogVideoXI2VInpaintAnyLPipeline,
         )
         results["custom_diffusers_pipeline"] = True
@@ -360,7 +360,7 @@ class ModelManager:
             sys.path.insert(0, vp_root)
 
             from diffusers import CogVideoXTransformer3DModel
-            from diffusers.pipelines.cogvideo.pipeline_cogvideox_inpainting_i2v_anyl import (
+            from diffusers.pipelines.cogvideo import (
                 CogVideoXI2VInpaintAnyLPipeline,
             )
 
