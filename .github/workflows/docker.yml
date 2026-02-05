@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # Should complete in ~3-5 min with base image
+    timeout-minutes: 90  # Base image is ~25GB, allow plenty of time for slow runners
 
     steps:
       - name: Checkout
