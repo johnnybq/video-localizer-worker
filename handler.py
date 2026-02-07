@@ -520,6 +520,7 @@ class ModelManager:
             from diffusers.pipelines.cogvideo import (
                 CogVideoXI2VInpaintAnyLPipeline,
             )
+            from diffusers.models.branch_cogvideox import CogvideoXBranchModel
 
             model_path = os.path.join(os.environ.get("HF_HOME", "/workspace/models/huggingface"),
                                        "THUDM/CogVideoX-5b-I2V")
@@ -555,16 +556,25 @@ class ModelManager:
                 model_path, subfolder="transformer", torch_dtype=torch.bfloat16
             )
 
-            logger.info("VideoPainter: Loading CogVideoXI2VInpaintAnyLPipeline with branch...")
+            logger.info("VideoPainter: Loading CogvideoXBranchModel from branch path...")
+            branch_model = CogvideoXBranchModel.from_pretrained(
+                branch_path, torch_dtype=torch.bfloat16
+            )
+
+            logger.info("VideoPainter: Loading CogVideoXI2VInpaintAnyLPipeline...")
             pipe = CogVideoXI2VInpaintAnyLPipeline.from_pretrained(
                 model_path,
-                branch=branch_path,
+                branch=branch_model,
                 transformer=transformer,
                 torch_dtype=torch.bfloat16,
             ).to(self.device)
 
-            pipe.enable_xformers_memory_efficient_attention()
-            logger.info("VideoPainter: ✓ Pipeline loaded successfully with xformers")
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                logger.info("VideoPainter: ✓ Pipeline loaded with xformers")
+            except Exception as e:
+                logger.warning(f"VideoPainter: xformers not available ({e}), using default attention")
+            logger.info("VideoPainter: ✓ Pipeline loaded successfully")
             return pipe
 
         elif name == "video_retalking":
@@ -1080,7 +1090,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         import traceback
         err_msg = f"VideoPainter failed: {e}"
         logger.warning(err_msg)
-        logger.debug(f"VideoPainter traceback:\n{traceback.format_exc()}")
+        logger.warning(f"VideoPainter traceback:\n{traceback.format_exc()}")
         all_errors.append(err_msg)
 
     # Fallback to ProPainter
@@ -1094,7 +1104,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         import traceback
         err_msg = f"ProPainter failed: {e}"
         logger.error(err_msg)
-        logger.debug(f"ProPainter traceback:\n{traceback.format_exc()}")
+        logger.warning(f"ProPainter traceback:\n{traceback.format_exc()}")
         all_errors.append(err_msg)
 
     # All methods failed - eraser plate is now REQUIRED
@@ -1179,7 +1189,7 @@ def _inpaint_propainter(video_path: str, mask_path: str, output_path: str) -> st
             "--video", video_frames_dir,
             "--mask", mask_frames_dir,
             "--output", result_dir,
-            "--resize_ratio", "0.5",  # Memory optimization
+            "--resize_ratio", "1.0",  # Full resolution for better text removal
             "--ref_stride", "10",
             "--neighbor_length", "10",
             "--subvideo_length", "80",
@@ -1194,30 +1204,40 @@ def _inpaint_propainter(video_path: str, mask_path: str, output_path: str) -> st
             timeout=600,  # 10 min timeout
         )
 
+        if result.stdout:
+            logger.info(f"ProPainter stdout: {result.stdout.decode()[-300:]}")
         if result.returncode != 0:
-            logger.error(f"ProPainter failed: {result.stderr.decode()[:500]}")
+            logger.error(f"ProPainter failed (rc={result.returncode}): {result.stderr.decode()[:500]}")
             raise RuntimeError(f"ProPainter subprocess failed: {result.stderr.decode()[:200]}")
 
-        # Find output video in result_dir
-        result_files = [f for f in os.listdir(result_dir) if f.endswith(('.mp4', '.avi'))]
-        if not result_files:
-            # ProPainter outputs frames, need to reassemble
-            logger.info("ProPainter: Reassembling frames to video")
-            result_frames = sorted([f for f in os.listdir(result_dir) if f.endswith('.png')])
-            if not result_frames:
-                raise RuntimeError("ProPainter produced no output frames")
+        # ProPainter saves to {result_dir}/{video_dir_basename}/inpaint_out.mp4
+        # where video_dir_basename = os.path.basename(video_frames_dir)
+        video_dir_name = os.path.basename(video_frames_dir)
+        expected_output = os.path.join(result_dir, video_dir_name, "inpaint_out.mp4")
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-            for fname in result_frames:
-                frame = cv2.imread(os.path.join(result_dir, fname))
-                frame_resized = cv2.resize(frame, (width, height))
-                out.write(frame_resized)
-            out.release()
+        if os.path.exists(expected_output):
+            logger.info(f"ProPainter: Found output at {expected_output}")
+            shutil.copy(expected_output, output_path)
         else:
-            # Copy result video
-            shutil.copy(os.path.join(result_dir, result_files[0]), output_path)
+            # Fallback: search recursively for any mp4 or png output
+            logger.warning(f"ProPainter: Expected output not at {expected_output}")
+            logger.warning(f"ProPainter: result_dir contents: {os.listdir(result_dir)}")
+            # Check subdirectories
+            found = False
+            for sub in os.listdir(result_dir):
+                sub_path = os.path.join(result_dir, sub)
+                if os.path.isdir(sub_path):
+                    inpaint_mp4 = os.path.join(sub_path, "inpaint_out.mp4")
+                    if os.path.exists(inpaint_mp4):
+                        logger.info(f"ProPainter: Found output in subdirectory: {inpaint_mp4}")
+                        shutil.copy(inpaint_mp4, output_path)
+                        found = True
+                        break
+            if not found:
+                raise RuntimeError(
+                    f"ProPainter produced no output. Expected: {expected_output}. "
+                    f"result_dir contents: {os.listdir(result_dir)}"
+                )
 
         # Re-add original audio
         _copy_audio(video_path, output_path)
@@ -1341,10 +1361,26 @@ def _inpaint_videopainter(video_path: str, mask_path: str, output_path: str, pip
     step = max_frames - overlap
     all_output_frames = []
 
+    min_chunk_frames = 25  # CogVideoX stride=24, needs at least stride+1 frames
+
     for chunk_idx, chunk_start in enumerate(range(0, len(video_frames), step)):
         chunk_end = min(chunk_start + max_frames, len(video_frames))
+
+        # If last chunk is too small, extend start backwards to get enough frames
+        if chunk_end - chunk_start < min_chunk_frames:
+            chunk_start = max(0, chunk_end - min_chunk_frames)
+            if chunk_end - chunk_start < min_chunk_frames:
+                # Video is too short — pad with last frame
+                pad_count = min_chunk_frames - (chunk_end - chunk_start)
+                logger.info(f"VideoPainter: Padding last chunk with {pad_count} duplicate frames")
+
         chunk_masked = masked_frames[chunk_start:chunk_end]
         chunk_masks = mask_frames[chunk_start:chunk_end]
+
+        # Pad if still too short
+        while len(chunk_masked) < min_chunk_frames:
+            chunk_masked.append(chunk_masked[-1])
+            chunk_masks.append(chunk_masks[-1])
 
         inpaint_out = pipe(
             prompt="",
@@ -2794,7 +2830,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     )
 
             except Exception as e:
+                import traceback
                 logger.error(f"Stage {stage_name} failed: {e}")
+                logger.error(f"Stage {stage_name} traceback:\n{traceback.format_exc()}")
                 metrics.errors.append(f"{stage_name}: {str(e)}")
 
                 if stage_name in CRITICAL_STAGES:
