@@ -17,9 +17,10 @@ VRAM Budget (A100 80GB):
 │ Demucs             │ 2GB   │ 2 (keep) │
 │ GFPGAN             │ 2GB   │ 4 (temp) │
 │ Real-ESRGAN        │ 3GB   │ 4 (temp) │
-│ PaddleOCR          │ 2GB   │ 1 (keep) │
+│ DeepSeek-OCR-2     │ 7GB   │ 1 (keep) │
+│ PaddleOCR          │ 2GB   │ 1 (fallb)│
 ├────────────────────┼───────┼──────────┤
-│ Peak usage         │ ~40GB │          │
+│ Peak usage         │ ~45GB │          │
 │ Available          │ 80GB  │          │
 └────────────────────┴───────┴──────────┘
 """
@@ -51,6 +52,18 @@ except ImportError:
     _ft = types.ModuleType("torchvision.transforms.functional_tensor")
     _ft.rgb_to_grayscale = rgb_to_grayscale
     sys.modules["torchvision.transforms.functional_tensor"] = _ft
+
+# =============================================================================
+# Monkey-patch: transformers.utils.FLAX_WEIGHTS_NAME
+# Removed in transformers >=4.47, but VideoPainter's custom diffusers imports it.
+# Must be applied BEFORE any diffusers/VideoPainter import.
+# =============================================================================
+try:
+    import transformers.utils
+    if not hasattr(transformers.utils, 'FLAX_WEIGHTS_NAME'):
+        transformers.utils.FLAX_WEIGHTS_NAME = "flax_model.msgpack"
+except ImportError:
+    pass
 
 import torch
 import numpy as np

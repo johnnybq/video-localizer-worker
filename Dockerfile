@@ -2,7 +2,7 @@
 # TrafficPlant Video Localizer - FINAL IMAGE
 # ==============================================================================
 # Lightweight image that extends base with application code only.
-# Build time: ~2-3 minutes (just copies handler files)
+# Build time: ~3-5 minutes (upgrades transformers + copies handler files)
 #
 # Requires: johnnybq/video-localizer-base:v2 (with VideoPainter + custom diffusers)
 # ==============================================================================
@@ -14,12 +14,17 @@ LABEL description="TrafficPlant Video Localizer worker for Vast.ai"
 WORKDIR /app
 
 # ==============================================================================
-# Application code only — base image has all dependencies
+# Upgrade transformers for DeepSeek-OCR-2 (base image has 4.42.2 for VideoPainter)
+# DeepSeek-OCR-2 requires >=4.46.3 for model format support.
+# VideoPainter compat: FLAX_WEIGHTS_NAME shim is applied at runtime in handler.py
+# ==============================================================================
+RUN pip install --no-cache-dir "transformers>=4.47" "addict" "easydict" && \
+    rm -rf /root/.cache/pip /tmp/*
+
+# ==============================================================================
+# Application code only
 # ==============================================================================
 COPY handler.py handler_vast.py ./
-
-# Skip sanity check — imports verified in base, avoid slow torch init
-# RUN python3 -c "import handler; print('handler.py loaded OK')"
 
 # Pull-based: worker polls backend, no port needed
 ENTRYPOINT []
