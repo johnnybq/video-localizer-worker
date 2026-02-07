@@ -2503,6 +2503,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             translated_text=job_input.get("translated_text"),  # Pre-translated from server
             translated_overlays=job_input.get("translated_overlays"),  # Pre-translated text overlays
             subtitle_style=job_input.get("subtitle_style"),  # Original subtitle style from manifest
+            elevenlabs_voice_id=job_input.get("elevenlabs_voice_id"),  # Pre-cloned voice ID
         )
 
         mm = get_model_manager()
