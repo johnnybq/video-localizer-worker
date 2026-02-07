@@ -327,7 +327,7 @@ class ModelManager:
 
     MODEL_CONFIGS = {
         # Model: (vram_gb, priority, keep_loaded)
-        "deepseek_ocr": (16, 1, True),
+        "deepseek_ocr": (7, 1, True),   # 3B params, BF16 = ~6.8GB
         "paddleocr": (2, 1, True),
         "sam2": (3, 1, True),
         "faster_whisper": (3, 2, True),
@@ -442,9 +442,12 @@ class ModelManager:
             model_id = "deepseek-ai/DeepSeek-OCR-2"
             tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             model = AutoModel.from_pretrained(
-                model_id, trust_remote_code=True,
-                torch_dtype=torch.float16
-            ).to(self.device).eval()
+                model_id,
+                trust_remote_code=True,
+                use_safetensors=True,
+                _attn_implementation="flash_attention_2",
+            )
+            model = model.eval().cuda().to(torch.bfloat16)
             return {"model": model, "tokenizer": tokenizer}
 
         elif name == "paddleocr":
@@ -658,9 +661,14 @@ def stage_detect_text(video_path: str, mm: ModelManager) -> Dict:
 
 
 def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
-    """Detect text using DeepSeek-OCR-2 (chat-based VLM OCR)."""
+    """Detect text using DeepSeek-OCR-2 (model.infer API with grounding mode).
+
+    DeepSeek-OCR-2 outputs: <|ref|>label<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>text
+    Coordinates are normalized 0-999, independent of image resolution.
+    """
     import cv2
-    from PIL import Image
+    import re
+    import tempfile
 
     deepseek = mm.load("deepseek_ocr")
     model, tokenizer = deepseek["model"], deepseek["tokenizer"]
@@ -674,50 +682,93 @@ def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
     detections = []
     sample_rate = max(1, int(fps / 2))  # 2 fps sampling
 
-    for i in range(0, frame_count, sample_rate):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # Regex for grounding output: <|ref|>label<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>
+    det_pattern = re.compile(r'<\|ref\|>([^<]*)<\|/ref\|><\|det\|>([^<]*)<\|/det\|>')
 
-        pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    # Temp dir for frame images (model.infer needs file path)
+    tmp_dir = tempfile.mkdtemp(prefix="deepseek_ocr_")
 
-        # DeepSeek-OCR uses chat interface for structured OCR
-        prompt = "Detect all text in this image. For each text region, output the bounding box coordinates [x1, y1, x2, y2] and the text content. Format as JSON array."
+    try:
+        for i in range(0, frame_count, sample_rate):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        inputs = tokenizer.apply_chat_template(
-            [{"role": "user", "content": [{"type": "image", "image": pil_img}, {"type": "text", "text": prompt}]}],
-            return_tensors="pt", add_generation_prompt=True
-        ).to(model.device)
+            # Save frame as temp image (model.infer requires file path)
+            frame_path = os.path.join(tmp_dir, f"frame_{i}.jpg")
+            cv2.imwrite(frame_path, frame)
 
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+            try:
+                # Use grounding OCR prompt — returns text + bounding boxes
+                res = model.infer(
+                    tokenizer,
+                    prompt="<image>\n<|grounding|>OCR this image.",
+                    image_file=frame_path,
+                    output_path=tmp_dir,
+                    base_size=1024,
+                    image_size=768,
+                    crop_mode=False,
+                    save_results=False,
+                )
 
-        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                # res is the raw model output string with <|ref|>/<|det|> tags
+                if not res or not isinstance(res, str):
+                    continue
 
-        # Parse response — extract JSON array of detections
-        try:
-            import re
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_match:
-                items = json.loads(json_match.group())
-                for item in items:
-                    bbox = item.get("bbox", item.get("box", []))
-                    text = item.get("text", "")
-                    if bbox and text and len(text) > 1:
-                        x1, y1, x2, y2 = bbox[:4]
-                        detections.append({
-                            "frame_idx": i,
-                            "timestamp": i / fps,
-                            "bbox": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
-                            "bbox_norm": [x1 / width, y1 / height, x2 / width, y2 / height],
-                            "text": text,
-                            "confidence": 0.95,  # DeepSeek doesn't output confidence
-                        })
-        except Exception as parse_err:
-            logger.warning(f"DeepSeek-OCR parse error at frame {i}: {parse_err}")
+                # Parse grounding tags
+                for match in det_pattern.finditer(res):
+                    label = match.group(1).strip()
+                    coords_str = match.group(2).strip()
 
-    cap.release()
+                    try:
+                        coords_list = eval(coords_str)  # [[x1,y1,x2,y2], ...]
+                        if not isinstance(coords_list, list):
+                            continue
+                        # Handle both [[x1,y1,x2,y2]] and [x1,y1,x2,y2]
+                        if coords_list and not isinstance(coords_list[0], list):
+                            coords_list = [coords_list]
+                    except Exception:
+                        continue
+
+                    # Extract text after the det tag (until next tag or end)
+                    det_end = match.end()
+                    next_ref = res.find("<|ref|>", det_end)
+                    text_after = res[det_end:next_ref].strip() if next_ref > 0 else res[det_end:].strip()
+                    # Remove any remaining special tokens
+                    text_after = re.sub(r'<\|[^|]*\|>', '', text_after).strip()
+
+                    for coords in coords_list:
+                        if len(coords) < 4:
+                            continue
+                        # Coords are normalized 0-999 → convert to pixel coords
+                        nx1, ny1, nx2, ny2 = coords[:4]
+                        px1 = int(nx1 * width / 999)
+                        py1 = int(ny1 * height / 999)
+                        px2 = int(nx2 * width / 999)
+                        py2 = int(ny2 * height / 999)
+
+                        det_text = text_after if text_after else label
+                        if det_text and len(det_text) > 1:
+                            detections.append({
+                                "frame_idx": i,
+                                "timestamp": i / fps,
+                                "bbox": [[px1, py1], [px2, py1], [px2, py2], [px1, py2]],
+                                "bbox_norm": [nx1 / 999, ny1 / 999, nx2 / 999, ny2 / 999],
+                                "text": det_text,
+                                "confidence": 0.95,
+                                "label": label,
+                            })
+
+            except Exception as frame_err:
+                logger.warning(f"DeepSeek-OCR frame {i} error: {frame_err}")
+
+    finally:
+        cap.release()
+        # Clean up temp frames
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
     mm.metrics.methods_used["ocr"] = "deepseek_ocr"
     unique_detections = _dedupe_detections(detections)
 
