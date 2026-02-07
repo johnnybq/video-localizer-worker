@@ -45,43 +45,6 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))         # seconds betw
 IDLE_SHUTDOWN_SECS = int(os.environ.get("IDLE_SHUTDOWN", "3600"))  # shutdown after N idle seconds (1 hour default)
 
 # =============================================================================
-# Model Preloading
-# =============================================================================
-
-def preload_models():
-    """
-    Preload large models before accepting tasks.
-    CogVideoX-5b-I2V is ~20GB and must be downloaded on first run.
-    """
-    import os
-
-    # CogVideoX for VideoPainter
-    hf_home = os.environ.get("HF_HOME", "/workspace/models/huggingface")
-    cogvideo_path = os.path.join(hf_home, "hub", "models--THUDM--CogVideoX-5b-I2V")
-    cogvideo_alt_path = os.path.join(hf_home, "THUDM/CogVideoX-5b-I2V")
-
-    if os.path.exists(cogvideo_path) or os.path.exists(cogvideo_alt_path):
-        log.info(f"✓ CogVideoX-5b-I2V already cached")
-    else:
-        log.info("=" * 60)
-        log.info("Preloading CogVideoX-5b-I2V (~20GB)...")
-        log.info("This is required for VideoPainter inpainting.")
-        log.info("=" * 60)
-
-        try:
-            from huggingface_hub import snapshot_download
-            snapshot_download(
-                "THUDM/CogVideoX-5b-I2V",
-                cache_dir=hf_home,
-                resume_download=True,
-            )
-            log.info("✓ CogVideoX-5b-I2V preloaded successfully!")
-        except Exception as e:
-            log.warning(f"⚠ CogVideoX preload failed: {e}")
-            log.warning("VideoPainter may fail, ProPainter fallback will be used.")
-
-
-# =============================================================================
 # Import Handler Logic
 # =============================================================================
 
@@ -250,6 +213,25 @@ def process_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
     set_progress_callback(_on_stage)
 
+    # Start heartbeat thread (20s interval)
+    import threading
+    heartbeat_stop = threading.Event()
+
+    def _heartbeat_loop():
+        while not heartbeat_stop.is_set():
+            try:
+                requests.post(
+                    PROGRESS_URL,
+                    json={"task_id": task_id, "worker_id": WORKER_ID, "stage": "heartbeat", "elapsed": 0, "errors": []},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            heartbeat_stop.wait(20)
+
+    heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+
     # Build job_input in the format handler() expects
     job_input = {
         "id": task_id,
@@ -257,7 +239,10 @@ def process_task(task: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     start = time.time()
-    result = run_localization(job_input)
+    try:
+        result = run_localization(job_input)
+    finally:
+        heartbeat_stop.set()
     elapsed = time.time() - start
 
     log.info(f"Task {task_id} finished in {elapsed:.1f}s — status: {result.get('status')}")
@@ -277,6 +262,14 @@ def main():
     log.info(f"  idle_shutdown: {IDLE_SHUTDOWN_SECS}s")
     log.info(f"  gpu:          {get_gpu_name()}")
     log.info(f"{'=' * 60}")
+
+    # Preload models to eliminate first-job latency
+    try:
+        mm = get_model_manager()
+        mm.preload()
+        log.info("Model preloading complete")
+    except Exception as e:
+        log.warning(f"Model preloading failed (will load on demand): {e}")
 
     idle_since = time.time()
     tasks_completed = 0
@@ -321,5 +314,4 @@ def main():
 
 
 if __name__ == "__main__":
-    preload_models()
     main()

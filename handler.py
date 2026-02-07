@@ -55,6 +55,9 @@ except ImportError:
 import torch
 import numpy as np
 
+# RTL (Right-to-Left) languages for subtitle rendering
+RTL_LANGUAGES = {"ar", "he", "fa", "ur", "yi"}
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -79,14 +82,18 @@ def set_progress_callback(fn):
 # =============================================================================
 
 class PipelineStage(Enum):
-    """Video localization pipeline stages."""
-    PREPROCESS = "preprocess"          # Audio separation (demucs)
-    DETECT_TEXT = "detect_text"        # PaddleOCR
-    CREATE_MASK = "create_mask"        # SAM 2.1
-    INPAINT = "inpaint"                # VideoPainter (TencentARC)
-    RENDER_TEXT = "render_text"        # Draw translated text overlays (ffmpeg)
-    TRANSCRIBE = "transcribe"          # Faster-Whisper
+    """Video localization pipeline stages.
+    Order matters: stages execute in enum order by default.
+    TRANSCRIBE moved before DETECT_TEXT — both are independent
+    (transcribe uses vocals_path, detect_text uses video_path).
+    """
+    PREPROCESS = "preprocess"          # Audio separation (Demucs)
+    TRANSCRIBE = "transcribe"          # Speech recognition (Whisper) — uses vocals from preprocess
+    DETECT_TEXT = "detect_text"        # OCR (DeepSeek/PaddleOCR)
+    CREATE_MASK = "create_mask"        # SAM 2.1 mask generation
+    INPAINT = "inpaint"                # VideoPainter/ProPainter
     TRANSLATE = "translate"            # Server-side (Gemini 3 Pro)
+    RENDER_TEXT = "render_text"        # ASS subtitles (ffmpeg)
     TTS = "tts"                        # ElevenLabs → F5-TTS
     LIPSYNC = "lipsync"                # VideoRetalking / MuseTalk
     ENHANCE = "enhance"                # GFPGAN face enhancement
@@ -99,6 +106,9 @@ class PipelineStage(Enum):
 # If any of these fail, the job returns status="error" instead of "success".
 CRITICAL_STAGES = {"transcribe", "translate", "tts", "assemble"}
 
+# Stages where failure degrades output quality but doesn't block the job.
+QUALITY_CRITICAL_STAGES = {"detect_text", "create_mask", "render_text"}
+
 
 # =============================================================================
 # Language Code Normalization
@@ -106,12 +116,15 @@ CRITICAL_STAGES = {"transcribe", "translate", "tts", "assemble"}
 
 LANGUAGE_CODE_MAP = {
     "en": ["en", "en-US", "en-GB", "en-AU"],
-    "pt": ["pt", "pt-BR", "pt-PT"],
-    "es": ["es", "es-MX", "es-ES", "es-AR"],
+    "pt": ["pt", "pt-PT"],              # European Portuguese
+    "pt-BR": ["pt-BR"],                 # Brazilian Portuguese
+    "es": ["es", "es-ES", "es-AR"],
+    "es-MX": ["es-MX"],                 # Mexican Spanish (distinct)
     "ru": ["ru", "ru-RU"],
     "de": ["de", "de-DE", "de-AT", "de-CH"],
     "fr": ["fr", "fr-FR", "fr-CA"],
-    "zh": ["zh", "zh-CN", "zh-TW", "zh-HK"],
+    "zh-CN": ["zh-CN", "zh"],           # Simplified Chinese
+    "zh-TW": ["zh-TW", "zh-HK"],       # Traditional Chinese
     "ja": ["ja", "ja-JP"],
     "ko": ["ko", "ko-KR"],
     "ar": ["ar", "ar-SA"],
@@ -124,6 +137,8 @@ LANGUAGE_CODE_MAP = {
     "vi": ["vi", "vi-VN"],
     "th": ["th", "th-TH"],
     "id": ["id", "id-ID"],
+    "sr": ["sr", "sr-Cyrl"],            # Serbian Cyrillic
+    "sr-Latn": ["sr-Latn"],             # Serbian Latin
 }
 
 # Build reverse lookup: locale → base language
@@ -269,6 +284,10 @@ class JobConfig:
     # Original subtitle style from Gemini manifest (font, color, background, etc.)
     subtitle_style: Optional[Dict] = None
 
+    # Pre-cloned ElevenLabs voice ID (from server-side caching)
+    # If provided, skips per-call voice cloning and uses this voice directly
+    elevenlabs_voice_id: Optional[str] = None
+
     # R2 storage config
     r2_bucket: str = "trafficplant"
     r2_prefix: str = "localized"
@@ -281,6 +300,8 @@ class PipelineMetrics:
     model_loads: Dict[str, float] = field(default_factory=dict)
     quality_scores: Dict[str, float] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
+    methods_used: Dict[str, str] = field(default_factory=dict)
+    quality_warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
@@ -288,6 +309,8 @@ class PipelineMetrics:
             "model_load_times_ms": {k: v * 1000 for k, v in self.model_loads.items()},
             "quality_scores": self.quality_scores,
             "errors": self.errors,
+            "methods_used": self.methods_used,
+            "quality_warnings": self.quality_warnings,
             "total_time_ms": sum(self.stage_times.values()) * 1000
         }
 
@@ -304,6 +327,7 @@ class ModelManager:
 
     MODEL_CONFIGS = {
         # Model: (vram_gb, priority, keep_loaded)
+        "deepseek_ocr": (16, 1, True),
         "paddleocr": (2, 1, True),
         "sam2": (3, 1, True),
         "faster_whisper": (3, 2, True),
@@ -328,6 +352,21 @@ class ModelManager:
             self.MODEL_CONFIGS[name][0]
             for name in self.loaded
         )
+
+    def preload(self):
+        """Preload all keep_loaded models at startup to eliminate first-job latency."""
+        logger.info("ModelManager: Preloading keep_loaded models...")
+        for name, (vram, priority, keep) in self.MODEL_CONFIGS.items():
+            if keep:
+                try:
+                    logger.info(f"  Preloading {name} ({vram}GB)...")
+                    self.load(name)
+                    logger.info(f"  Preloaded {name} OK")
+                except Exception as e:
+                    logger.warning(f"  Preload {name} failed: {e}")
+
+        loaded_vram = self._get_used_vram()
+        logger.info(f"Preload complete: {len(self.loaded)} models, {loaded_vram}GB VRAM used")
 
     def _ensure_vram(self, needed: int, exclude: List[str] = None):
         """Unload models to free VRAM, respecting priorities."""
@@ -398,7 +437,17 @@ class ModelManager:
     def _load_model(self, name: str) -> Any:
         """Actually load a specific model."""
 
-        if name == "paddleocr":
+        if name == "deepseek_ocr":
+            from transformers import AutoModel, AutoTokenizer
+            model_id = "deepseek-ai/DeepSeek-OCR-2"
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            model = AutoModel.from_pretrained(
+                model_id, trust_remote_code=True,
+                torch_dtype=torch.float16
+            ).to(self.device).eval()
+            return {"model": model, "tokenizer": tokenizer}
+
+        elif name == "paddleocr":
             from paddleocr import PaddleOCR
             # Use 'en' for detection (works for Latin/Cyrillic scripts)
             # PaddleOCR doesn't support 'multilingual' - use specific lang
@@ -596,10 +645,96 @@ def stage_preprocess(video_path: str, mm: ModelManager) -> Dict:
 
 
 def stage_detect_text(video_path: str, mm: ModelManager) -> Dict:
-    """Detect text overlays using PaddleOCR + EasyOCR ensemble."""
+    """Detect text overlays using DeepSeek-OCR-2 (primary) with PaddleOCR fallback."""
     logger.info("Stage: DETECT_TEXT")
 
+    # Try DeepSeek-OCR first
+    try:
+        return _detect_text_deepseek(video_path, mm)
+    except Exception as e:
+        logger.warning(f"DeepSeek-OCR failed, falling back to PaddleOCR: {e}")
+        mm.metrics.methods_used["ocr"] = "paddleocr"
+        return _detect_text_paddle(video_path, mm)
+
+
+def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
+    """Detect text using DeepSeek-OCR-2 (chat-based VLM OCR)."""
     import cv2
+    from PIL import Image
+
+    deepseek = mm.load("deepseek_ocr")
+    model, tokenizer = deepseek["model"], deepseek["tokenizer"]
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    detections = []
+    sample_rate = max(1, int(fps / 2))  # 2 fps sampling
+
+    for i in range(0, frame_count, sample_rate):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        # DeepSeek-OCR uses chat interface for structured OCR
+        prompt = "Detect all text in this image. For each text region, output the bounding box coordinates [x1, y1, x2, y2] and the text content. Format as JSON array."
+
+        inputs = tokenizer.apply_chat_template(
+            [{"role": "user", "content": [{"type": "image", "image": pil_img}, {"type": "text", "text": prompt}]}],
+            return_tensors="pt", add_generation_prompt=True
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
+
+        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+        # Parse response — extract JSON array of detections
+        try:
+            import re
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if json_match:
+                items = json.loads(json_match.group())
+                for item in items:
+                    bbox = item.get("bbox", item.get("box", []))
+                    text = item.get("text", "")
+                    if bbox and text and len(text) > 1:
+                        x1, y1, x2, y2 = bbox[:4]
+                        detections.append({
+                            "frame_idx": i,
+                            "timestamp": i / fps,
+                            "bbox": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                            "bbox_norm": [x1 / width, y1 / height, x2 / width, y2 / height],
+                            "text": text,
+                            "confidence": 0.95,  # DeepSeek doesn't output confidence
+                        })
+        except Exception as parse_err:
+            logger.warning(f"DeepSeek-OCR parse error at frame {i}: {parse_err}")
+
+    cap.release()
+    mm.metrics.methods_used["ocr"] = "deepseek_ocr"
+    unique_detections = _dedupe_detections(detections)
+
+    return {
+        "detections": unique_detections,
+        "total_found": len(detections),
+        "unique_regions": len(unique_detections),
+        "fps": fps,
+        "frame_count": frame_count,
+        "resolution": (width, height),
+    }
+
+
+def _detect_text_paddle(video_path: str, mm: ModelManager) -> Dict:
+    """Detect text overlays using PaddleOCR (fallback)."""
+    import cv2
+
     ocr = mm.load("paddleocr")
 
     cap = cv2.VideoCapture(video_path)
@@ -640,6 +775,7 @@ def stage_detect_text(video_path: str, mm: ModelManager) -> Dict:
                     })
 
     cap.release()
+    mm.metrics.methods_used["ocr"] = "paddleocr"
 
     # Deduplicate similar detections
     unique_detections = _dedupe_detections(detections)
@@ -831,6 +967,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         with mm.use("videopainter") as videopainter:
             result = _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
             logger.info("INPAINT: VideoPainter succeeded!")
+            mm.metrics.methods_used["inpaint"] = "videopainter"
             return result, True
     except Exception as e:
         import traceback
@@ -844,6 +981,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         logger.info("INPAINT: Attempting ProPainter fallback...")
         result = _inpaint_propainter(video_path, mask_path, output_path)
         logger.info("INPAINT: ProPainter succeeded!")
+        mm.metrics.methods_used["inpaint"] = "propainter"
         return result, True
     except Exception as e:
         import traceback
@@ -856,6 +994,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
     combined_error = f"inpaint: ALL methods failed - {'; '.join(all_errors)}"
     logger.error(combined_error)
     logger.warning("INPAINT: Falling back to ERASER-PLATE-ONLY mode (original text NOT removed)")
+    mm.metrics.methods_used["inpaint"] = "eraser_plate_only"
     if errors is not None:
         errors.append(combined_error)
 
@@ -1088,11 +1227,14 @@ def _inpaint_videopainter(video_path: str, mask_path: str, output_path: str, pip
         v_np[m_np > 128] = 0
         masked_frames.append(Image.fromarray(v_np))
 
-    # Limit to 49 frames (CogVideoX constraint), process in chunks for longer videos
+    # Process in chunks of 49 frames (CogVideoX constraint) with 10-frame overlap
+    # for smooth cross-fade transitions between chunks
     max_frames = 49
+    overlap = 10
+    step = max_frames - overlap
     all_output_frames = []
 
-    for chunk_start in range(0, len(video_frames), max_frames):
+    for chunk_idx, chunk_start in enumerate(range(0, len(video_frames), step)):
         chunk_end = min(chunk_start + max_frames, len(video_frames))
         chunk_masked = masked_frames[chunk_start:chunk_end]
         chunk_masks = mask_frames[chunk_start:chunk_end]
@@ -1113,7 +1255,28 @@ def _inpaint_videopainter(video_path: str, mask_path: str, output_path: str, pip
         )
 
         chunk_frames = inpaint_out.frames[0] if hasattr(inpaint_out, 'frames') else inpaint_out[0]
-        all_output_frames.extend(chunk_frames)
+
+        if chunk_idx == 0:
+            all_output_frames.extend(chunk_frames)
+        else:
+            # Cross-fade overlapping region with linear blend
+            actual_overlap = min(overlap, len(chunk_frames), len(all_output_frames))
+            for j in range(actual_overlap):
+                alpha = j / overlap
+                prev = np.array(all_output_frames[-(actual_overlap - j)])
+                curr = np.array(chunk_frames[j])
+                if prev.dtype == np.float32 or prev.dtype == np.float64:
+                    prev = (prev * 255).clip(0, 255).astype(np.uint8)
+                if curr.dtype == np.float32 or curr.dtype == np.float64:
+                    curr = (curr * 255).clip(0, 255).astype(np.uint8)
+                blended = ((1 - alpha) * prev + alpha * curr).astype(np.uint8)
+                all_output_frames[-(actual_overlap - j)] = Image.fromarray(blended)
+            # Add non-overlapping frames
+            all_output_frames.extend(chunk_frames[actual_overlap:])
+
+        # Break if we've processed all frames
+        if chunk_end >= len(video_frames):
+            break
 
     # Write output video
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -1508,6 +1671,7 @@ def _generate_ass_subtitles(
     video_fps: float,
     subtitle_style: Optional[Dict] = None,
     inpaint_succeeded: bool = True,
+    target_language: str = "",
 ) -> str:
     """
     Generate ASS subtitle file with SOTA Logic 3.0.
@@ -1517,9 +1681,15 @@ def _generate_ass_subtitles(
     2. Layer 1: White translated text on top
 
     This GUARANTEES original text is covered, even if Inpaint fails.
+    Supports RTL languages (Arabic, Hebrew, Farsi, Urdu, Yiddish).
     """
     # Font size: ~3.2% of video height for mobile readability
     font_size = int(video_height * 0.032)
+
+    # Detect RTL language
+    is_rtl = any(target_language.startswith(lang) for lang in RTL_LANGUAGES) if target_language else False
+    if is_rtl:
+        logger.info(f"ASS: RTL mode enabled for language '{target_language}'")
 
     # Eraser plate color: FULLY OPAQUE BLACK when inpaint failed, dark gray otherwise
     # ASS format: &HAABBGGRR where AA=alpha (00=opaque, FF=transparent)
@@ -1531,9 +1701,15 @@ def _generate_ass_subtitles(
         eraser_color = "&H00000000"  # Pure black, fully opaque
         logger.info("ASS: Using FULLY OPAQUE BLACK eraser plates (inpaint failed)")
 
-    # ASS Header with two styles:
-    # - EraserPlate: solid background to cover original text
-    # - TranslatedText: white text with thin outline
+    # RTL font selection
+    rtl_font = ""
+    if is_rtl:
+        if target_language.startswith(("ar", "fa", "ur")):
+            rtl_font = "Noto Sans Arabic"
+        else:
+            rtl_font = "Noto Sans Hebrew"
+
+    # ASS Header with styles
     ass_content = f"""[Script Info]
 Title: TrafficPlant SOTA Subtitles v3
 ScriptType: v4.00+
@@ -1546,13 +1722,14 @@ ScaledBorderAndShadow: yes
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: EraserPlate,Arial,20,{eraser_color},{eraser_color},{eraser_color},{eraser_color},0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1
 Style: TranslatedText,Noto Sans,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.5,1,5,10,10,10,1
+"""
+    if is_rtl:
+        ass_content += f"Style: TranslatedTextRTL,{rtl_font},{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.5,1,5,10,10,10,1\n"
 
+    ass_content += """
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    # Style breakdown:
-    # EraserPlate: solid color plate, BorderStyle=1, no outline/shadow
-    # TranslatedText: PrimaryColour=&H00FFFFFF (white BGR), Bold=0, Outline=1.5, Shadow=1
 
     for i, overlay in enumerate(translated_overlays):
         translated_text = overlay.get("translated_text", "")
@@ -1630,6 +1807,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # Escape special ASS characters
         safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
 
+        # Apply RTL reshaping for Arabic/Persian/Urdu
+        if is_rtl:
+            try:
+                import arabic_reshaper
+                from bidi.algorithm import get_display
+                reshaped = arabic_reshaper.reshape(safe_text)
+                safe_text = get_display(reshaped)
+            except ImportError:
+                logger.warning("arabic_reshaper/python-bidi not installed, RTL rendering may be incorrect")
+            style_name = "TranslatedTextRTL"
+        else:
+            style_name = "TranslatedText"
+
         # Position: center of plate
         cx = (plate_x1 + plate_x2) // 2
         cy = (plate_y1 + plate_y2) // 2
@@ -1637,7 +1827,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # {\an5} = center alignment, {\pos(x,y)} = absolute position
         # {\fad(200,200)} = 200ms fade in/out
         text_event = (
-            f"Dialogue: 1,{start_time},{end_time},TranslatedText,,0,0,0,,"
+            f"Dialogue: 1,{start_time},{end_time},{style_name},,0,0,0,,"
             f"{{\\an5\\pos({cx},{cy})\\fad(200,200)}}{safe_text}"
         )
         ass_content += text_event + "\n"
@@ -1660,6 +1850,7 @@ def stage_render_text(
     fps: float,
     subtitle_style: Optional[Dict] = None,
     inpaint_succeeded: bool = True,
+    target_language: str = "",
 ) -> str:
     """
     Render translated text overlays onto video using ASS subtitles.
@@ -1705,6 +1896,7 @@ def stage_render_text(
         video_fps=video_fps,
         subtitle_style=subtitle_style,
         inpaint_succeeded=inpaint_succeeded,
+        target_language=target_language,
     )
 
     # Write ASS file to temp location
@@ -1806,8 +1998,13 @@ def stage_translate(text: str, source_lang: str, target_lang: str) -> str:
     )
 
 
-def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en") -> Optional[str]:
-    """Generate speech using ElevenLabs API (best quality, runs from GPU worker IP to avoid geo-blocks)."""
+def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en", voice_id: Optional[str] = None) -> Optional[str]:
+    """Generate speech using ElevenLabs API (best quality, runs from GPU worker IP to avoid geo-blocks).
+
+    Args:
+        voice_id: Pre-cloned voice ID from server. If provided, skips cloning and
+                  does NOT delete the voice (server handles cleanup).
+    """
     api_key = os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
         logger.info("ElevenLabs: no API key, skipping")
@@ -1816,28 +2013,33 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
     import httpx
 
     output_path = tempfile.mktemp(suffix=".mp3")
+    locally_cloned = False  # Track whether we cloned locally (for cleanup)
 
     try:
-        # Step 1: Create voice clone from reference audio
-        logger.info("ElevenLabs: cloning voice from reference audio...")
-        with open(reference_audio, "rb") as f:
-            clone_resp = httpx.post(
-                "https://api.elevenlabs.io/v1/voices/add",
-                headers={"xi-api-key": api_key},
-                data={"name": "clone_temp", "description": "Temporary clone for localization"},
-                files={"files": ("reference.wav", f, "audio/wav")},
-                timeout=30,
-            )
-        if clone_resp.status_code != 200:
-            logger.warning(f"ElevenLabs clone failed: {clone_resp.status_code} {clone_resp.text[:200]}")
-            return None
+        # Step 1: Use pre-cloned voice or create a new clone
+        if voice_id:
+            logger.info(f"ElevenLabs: using pre-cloned voice {voice_id}")
+        else:
+            logger.info("ElevenLabs: cloning voice from reference audio...")
+            with open(reference_audio, "rb") as f:
+                clone_resp = httpx.post(
+                    "https://api.elevenlabs.io/v1/voices/add",
+                    headers={"xi-api-key": api_key},
+                    data={"name": "clone_temp", "description": "Temporary clone for localization"},
+                    files={"files": ("reference.wav", f, "audio/wav")},
+                    timeout=30,
+                )
+            if clone_resp.status_code != 200:
+                logger.warning(f"ElevenLabs clone failed: {clone_resp.status_code} {clone_resp.text[:200]}")
+                return None
 
-        voice_id = clone_resp.json().get("voice_id")
-        if not voice_id:
-            logger.warning("ElevenLabs: no voice_id returned")
-            return None
+            voice_id = clone_resp.json().get("voice_id")
+            if not voice_id:
+                logger.warning("ElevenLabs: no voice_id returned")
+                return None
 
-        logger.info(f"ElevenLabs: voice cloned as {voice_id}")
+            locally_cloned = True
+            logger.info(f"ElevenLabs: voice cloned as {voice_id}")
 
         # Step 2: Generate speech with cloned voice
         try:
@@ -1852,10 +2054,10 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
                 },
             }
             # Add language_code for eleven_v3 (supports 70+ languages)
-            lang_code = normalize_language_code(target_language)
-            if lang_code:
-                tts_payload["language_code"] = lang_code
-                logger.info(f"ElevenLabs: using language_code={lang_code} (from {target_language})")
+            # Pass full locale (e.g. "zh-TW") — ElevenLabs v3 handles locale-specific voices
+            if target_language:
+                tts_payload["language_code"] = target_language
+                logger.info(f"ElevenLabs: using language_code={target_language}")
 
             tts_resp = httpx.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -1877,16 +2079,17 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
             return output_path
 
         finally:
-            # Step 3: Delete temporary voice clone
-            try:
-                httpx.delete(
-                    f"https://api.elevenlabs.io/v1/voices/{voice_id}",
-                    headers={"xi-api-key": api_key},
-                    timeout=10,
-                )
-                logger.info(f"ElevenLabs: deleted temp voice {voice_id}")
-            except Exception:
-                pass
+            # Step 3: Delete voice clone ONLY if we created it locally
+            if locally_cloned and voice_id:
+                try:
+                    httpx.delete(
+                        f"https://api.elevenlabs.io/v1/voices/{voice_id}",
+                        headers={"xi-api-key": api_key},
+                        timeout=10,
+                    )
+                    logger.info(f"ElevenLabs: deleted temp voice {voice_id}")
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.warning(f"ElevenLabs failed: {e}")
@@ -1911,17 +2114,19 @@ def _tts_f5(text: str, reference_audio: str, mm: ModelManager) -> str:
     return output_path
 
 
-def stage_tts(text: str, reference_audio: str, mm: ModelManager, target_language: str = "en") -> str:
-    """Generate speech: ElevenLabs API (primary) → F5-TTS local (fallback)."""
-    logger.info(f"Stage: TTS (target_language={target_language})")
+def stage_tts(text: str, reference_audio: str, mm: ModelManager, target_language: str = "en", voice_id: Optional[str] = None) -> Tuple[str, str]:
+    """Generate speech: ElevenLabs API (primary) → F5-TTS local (fallback).
+    Returns: (audio_path, method_used)
+    """
+    logger.info(f"Stage: TTS (target_language={target_language}, voice_id={'yes' if voice_id else 'no'})")
 
     # Primary: ElevenLabs (runs from US GPU IP — no geo-block)
-    result = _tts_elevenlabs(text, reference_audio, target_language=target_language)
+    result = _tts_elevenlabs(text, reference_audio, target_language=target_language, voice_id=voice_id)
     if result:
-        return result
+        return result, "elevenlabs"
 
     # Fallback: F5-TTS on local GPU
-    return _tts_f5(text, reference_audio, mm)
+    return _tts_f5(text, reference_audio, mm), "f5tts"
 
 
 def stage_lipsync(video_path: str, audio_path: str, quality: str, mm: ModelManager) -> str:
@@ -1936,6 +2141,8 @@ def stage_lipsync(video_path: str, audio_path: str, quality: str, mm: ModelManag
         model_name = "musetalk"
     else:
         model_name = "wav2lip"
+
+    mm.metrics.methods_used["lipsync"] = model_name
 
     with mm.use(model_name) as model:
         model.generate(
@@ -2033,17 +2240,17 @@ def stage_upscale(video_path: str, mm: ModelManager, scale: int = 2) -> str:
 
 
 def stage_quality_check(video_path: str, threshold: float) -> Dict:
-    """Assess output quality using no-reference metric (MUSIQ)."""
-    logger.info("Stage: QUALITY_CHECK (MUSIQ no-reference)")
+    """Assess output quality using no-reference metric (MUSIQ or NIQE fallback)."""
+    logger.info("Stage: QUALITY_CHECK")
 
     import pyiqa
     import cv2
 
-    # MUSIQ: no-reference image quality metric (0-100 scale)
+    metric_name = "musiq"
     try:
         metric = pyiqa.create_metric('musiq', device='cuda')
     except Exception:
-        # Fallback to NIQE if MUSIQ unavailable
+        metric_name = "niqe"
         metric = pyiqa.create_metric('niqe', device='cuda')
         logger.info("Using NIQE metric (MUSIQ unavailable)")
 
@@ -2059,24 +2266,44 @@ def stage_quality_check(video_path: str, threshold: float) -> Dict:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
             frame_tensor = frame_tensor.unsqueeze(0).cuda()
-
             score = metric(frame_tensor).item()
-            # MUSIQ returns 0-100, normalize to 0-1
-            normalized = score / 100.0 if score > 1.0 else score
-            scores.append(normalized)
+            scores.append(score)
 
     cap.release()
 
-    avg_score = sum(scores) / len(scores) if scores else 0
-    passed = avg_score >= threshold
+    if not scores:
+        return {
+            "score": 0, "raw_score": 0, "threshold": threshold,
+            "passed": False, "frame_scores": [], "metric": metric_name,
+        }
 
-    logger.info(f"Quality: {avg_score:.3f} (threshold: {threshold}, {'PASS' if passed else 'FAIL'})")
+    avg_score = sum(scores) / len(scores)
+
+    # Normalize based on metric type
+    if metric_name == "musiq":
+        # MUSIQ: 0-100 scale, higher = better
+        normalized = avg_score / 100.0 if avg_score > 1.0 else avg_score
+        passed = normalized >= threshold
+        effective_threshold = threshold
+    else:
+        # NIQE: lower = better, typical range 2-8
+        # Don't normalize to 0-1, use NIQE-specific threshold
+        normalized = avg_score
+        passed = avg_score <= 5.0
+        effective_threshold = 5.0
+
+    logger.info(
+        f"Quality ({metric_name}): raw={avg_score:.3f} normalized={normalized:.3f} "
+        f"threshold={effective_threshold} {'PASS' if passed else 'FAIL'}"
+    )
 
     return {
-        "score": avg_score,
-        "threshold": threshold,
+        "score": normalized,
+        "raw_score": avg_score,
+        "threshold": effective_threshold,
         "passed": passed,
-        "frame_scores": scores
+        "frame_scores": scores,
+        "metric": metric_name,
     }
 
 
@@ -2366,6 +2593,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                             state.get("text_fps", 30.0),
                             config.subtitle_style,
                             inpaint_succeeded=state.get("inpaint_succeeded", True),
+                            target_language=config.target_language,
                         )
                     else:
                         logger.info("RENDER_TEXT: No translated overlays provided, skipping")
@@ -2399,12 +2627,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
                 elif stage_name == "tts":
                     if config.voice_clone and state.get("translated_text"):
-                        state["tts_audio"] = stage_tts(
+                        tts_result, tts_method = stage_tts(
                             state["translated_text"],
                             state.get("vocals_path") or video_path,
                             mm,
                             target_language=config.target_language,
+                            voice_id=config.elevenlabs_voice_id,
                         )
+                        state["tts_audio"] = tts_result
+                        metrics.methods_used["tts"] = tts_method
                     elif not state.get("translated_text"):
                         raise RuntimeError("No translated text available for TTS")
 
@@ -2450,6 +2681,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 if stage_name in CRITICAL_STAGES:
                     critical_failure = f"Critical stage '{stage_name}' failed: {e}"
                     logger.error(f"CRITICAL FAILURE: {critical_failure}")
+                elif stage_name in QUALITY_CRITICAL_STAGES:
+                    metrics.quality_warnings.append(f"{stage_name}: {str(e)}")
+                    logger.warning(f"QUALITY WARNING: Stage '{stage_name}' failed — output may be degraded")
                 # Optional stages: continue
 
             metrics.stage_times[stage_name] = time.time() - t0

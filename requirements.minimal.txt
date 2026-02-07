@@ -19,9 +19,10 @@ pydub>=0.25.1
 soundfile>=0.12.0
 decord>=0.6.0                    # Required by SAM2 video predictor (init_state)
 
-# OCR
+# OCR — DeepSeek-OCR-2 (primary) + PaddleOCR (fallback)
 paddlepaddle>=2.6.0
 paddleocr>=2.8.0,<3.0.0
+flash-attn>=2.6.0                   # Required by DeepSeek-OCR-2 for efficient attention
 
 # Segmentation & Masking
 sam2>=1.0
@@ -63,6 +64,10 @@ realesrgan>=0.3.0
 
 # Replicate API (fallback for ProPainter inpainting)
 replicate>=1.0.0
+
+# RTL Text Rendering (Arabic, Hebrew, Farsi)
+arabic-reshaper>=3.0.0
+python-bidi>=0.6.0
 
 # Utilities
 numpy>=1.26.0
