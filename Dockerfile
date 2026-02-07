@@ -21,6 +21,7 @@ WORKDIR /app
 # - VideoPainter FLAX_WEIGHTS_NAME shim applied at runtime in handler.py
 # ==============================================================================
 RUN pip install --no-cache-dir "transformers==4.46.3" "addict" "easydict" && \
+    pip install --no-cache-dir flash-attn --no-build-isolation && \
     rm -rf /root/.cache/pip /tmp/*
 
 # ==============================================================================
