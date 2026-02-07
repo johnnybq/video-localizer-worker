@@ -458,7 +458,7 @@ class ModelManager:
                 model_id,
                 trust_remote_code=True,
                 use_safetensors=True,
-                _attn_implementation="flash_attention_2",
+                _attn_implementation="eager",  # flash_attention_2 needs flash-attn pkg (CUDA version mismatch in CI)
             )
             model = model.eval().cuda().to(torch.bfloat16)
             return {"model": model, "tokenizer": tokenizer}
@@ -947,15 +947,28 @@ def stage_create_mask(video_path: str, detections: List[Dict], mm: ModelManager)
 
     # Propagate masks through video
     mask_frames = {}
+    total_white_pixels = 0
     for frame_idx, obj_ids, masks in sam2.propagate_in_video(inference_state):
         # masks: torch.Tensor (num_objects, H, W) or (num_objects, 1, H, W)
-        masks_np = masks.cpu().numpy()
+        # CRITICAL: .float() converts BFloat16→Float32 before numpy (avoids dtype mismatch)
+        masks_np = masks.cpu().float().numpy()
         if masks_np.ndim == 4:
             masks_np = masks_np.squeeze(1)  # (N, 1, H, W) → (N, H, W)
         combined_mask = np.zeros(masks_np.shape[1:], dtype=np.uint8)
         for mask in masks_np:
             combined_mask = np.maximum(combined_mask, (mask > 0.5).astype(np.uint8) * 255)
         mask_frames[frame_idx] = combined_mask
+        total_white_pixels += int(np.sum(combined_mask > 0))
+
+    # Validate masks are non-empty (all-black masks mean SAM2 failed to segment)
+    if total_white_pixels == 0:
+        logger.error(
+            f"CREATE_MASK: All mask frames are BLACK (0 white pixels across {len(mask_frames)} frames). "
+            f"SAM2 failed to segment text regions. Returning None so inpaint knows mask failed."
+        )
+        return None
+
+    logger.info(f"CREATE_MASK: {len(mask_frames)} frames, {total_white_pixels} total white pixels")
 
     # Render mask video
     mask_path = video_path.replace(".mp4", "_mask.mp4")
@@ -1004,23 +1017,37 @@ def _render_mask_video(video_path: str, masks: Dict[int, np.ndarray], output_pat
     logger.info(f"MASK_VIDEO: Saved to {output_path}")
 
 
-def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Optional[List[str]] = None) -> Tuple[str, bool]:
+def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Optional[List[str]] = None, detections: Optional[List] = None) -> Tuple[str, bool]:
     """
     Remove text using VideoPainter (primary) or ProPainter (fallback).
 
     Args:
         errors: Optional list to append error messages (for metrics tracking)
+        detections: Text detections from OCR stage (to distinguish "no text" vs "mask failed")
 
     Returns:
         Tuple of (video_path, inpaint_succeeded)
-        - inpaint_succeeded=True: Text was removed, eraser plate optional
-        - inpaint_succeeded=False: Text NOT removed, eraser plate REQUIRED
+        - inpaint_succeeded=True: Text was removed OR no text detected, eraser plate optional
+        - inpaint_succeeded=False: Text detected but NOT removed, eraser plate REQUIRED
     """
     logger.info("Stage: INPAINT")
 
     if mask_path is None:
-        logger.info("No mask, skipping inpainting")
-        return video_path, True  # No text to remove = "success"
+        if detections:
+            # Text WAS detected by OCR but mask creation failed (e.g. SAM2 all-black)
+            # Original text is still visible — eraser plate REQUIRED
+            logger.warning(
+                f"INPAINT: mask_path is None but {len(detections)} text detections exist. "
+                f"SAM2 mask failed — eraser plate REQUIRED to cover original text."
+            )
+            if errors is not None:
+                errors.append("inpaint: mask creation failed (SAM2 all-black), text not removed")
+            mm.metrics.methods_used["inpaint"] = "eraser_plate_only"
+            return video_path, False
+        else:
+            # No text detected at all — legitimate skip, no eraser needed
+            logger.info("No mask and no text detections, skipping inpainting")
+            return video_path, True
 
     output_path = video_path.replace(".mp4", "_inpainted.mp4")
     all_errors = []
@@ -2643,7 +2670,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         state["video_path"],
                         state["mask_path"],
                         mm,
-                        errors=metrics.errors  # Track inpaint failures
+                        errors=metrics.errors,  # Track inpaint failures
+                        detections=state.get("text_detections", [])
                     )
                     state["video_path"] = video_path
                     state["inpaint_succeeded"] = inpaint_ok
