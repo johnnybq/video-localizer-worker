@@ -24,6 +24,12 @@ RUN pip install --no-cache-dir "transformers==4.46.3" "addict" "easydict" && \
     rm -rf /root/.cache/pip /tmp/*
 
 # ==============================================================================
+# Fix SAM2 BFloat16 dtype mismatch (maskmem_features needs float32, not bfloat16)
+# ==============================================================================
+RUN sed -i 's/maskmem_features = maskmem_features.to(torch.bfloat16)/maskmem_features = maskmem_features.to(torch.float32)/g' \
+    /usr/local/lib/python3.12/dist-packages/sam2/sam2_video_predictor.py 2>/dev/null || true
+
+# ==============================================================================
 # Application code only
 # ==============================================================================
 COPY handler.py handler_vast.py ./
