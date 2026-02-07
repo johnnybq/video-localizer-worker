@@ -723,14 +723,20 @@ def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
                     image_size=768,
                     crop_mode=False,
                     save_results=False,
+                    eval_mode=True,  # Must be True to return text (False streams to stdout, returns None)
                 )
 
                 # res is the raw model output string with <|ref|>/<|det|> tags
                 if not res or not isinstance(res, str):
                     continue
 
-                # Parse grounding tags
+                # Parse grounding tags (cap at 50 per frame to avoid hallucinations)
+                frame_dets = 0
+                MAX_DETS_PER_FRAME = 50
                 for match in det_pattern.finditer(res):
+                    if frame_dets >= MAX_DETS_PER_FRAME:
+                        logger.warning(f"Frame {i}: hit {MAX_DETS_PER_FRAME} det cap, skipping rest")
+                        break
                     label = match.group(1).strip()
                     coords_str = match.group(2).strip()
 
@@ -744,24 +750,23 @@ def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
                     except Exception:
                         continue
 
-                    # Extract text after the det tag (until next tag or end)
-                    det_end = match.end()
-                    next_ref = res.find("<|ref|>", det_end)
-                    text_after = res[det_end:next_ref].strip() if next_ref > 0 else res[det_end:].strip()
-                    # Remove any remaining special tokens
-                    text_after = re.sub(r'<\|[^|]*\|>', '', text_after).strip()
-
                     for coords in coords_list:
                         if len(coords) < 4:
                             continue
+                        # Validate all coords are numbers in 0-999 range
+                        if not all(isinstance(c, (int, float)) and 0 <= c <= 999 for c in coords[:4]):
+                            continue
                         # Coords are normalized 0-999 → convert to pixel coords
                         nx1, ny1, nx2, ny2 = coords[:4]
+                        # Skip tiny boxes (likely noise)
+                        if (nx2 - nx1) < 10 or (ny2 - ny1) < 5:
+                            continue
                         px1 = int(nx1 * width / 999)
                         py1 = int(ny1 * height / 999)
                         px2 = int(nx2 * width / 999)
                         py2 = int(ny2 * height / 999)
 
-                        det_text = text_after if text_after else label
+                        det_text = label
                         if det_text and len(det_text) > 1:
                             detections.append({
                                 "frame_idx": i,
@@ -772,6 +777,7 @@ def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
                                 "confidence": 0.95,
                                 "label": label,
                             })
+                            frame_dets += 1
 
             except Exception as frame_err:
                 logger.warning(f"DeepSeek-OCR frame {i} error: {frame_err}")
@@ -783,7 +789,9 @@ def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     mm.metrics.methods_used["ocr"] = "deepseek_ocr"
+    logger.info(f"DeepSeek-OCR raw detections: {len(detections)} across {frame_count} frames")
     unique_detections = _dedupe_detections(detections)
+    logger.info(f"DeepSeek-OCR unique detections: {len(unique_detections)}")
 
     return {
         "detections": unique_detections,
