@@ -15,10 +15,12 @@ WORKDIR /app
 
 # ==============================================================================
 # Upgrade transformers for DeepSeek-OCR-2 (base image has 4.42.2 for VideoPainter)
-# DeepSeek-OCR-2 requires >=4.46.3 for model format support.
-# VideoPainter compat: FLAX_WEIGHTS_NAME shim is applied at runtime in handler.py
+# Pin 4.46.3 — officially tested version for DeepSeek-OCR-2.
+# - 4.46.3 still has LlamaFlashAttention2 (removed in 4.47+)
+# - 4.46.3 supports DeepSeek-OCR-2 model format
+# - VideoPainter FLAX_WEIGHTS_NAME shim applied at runtime in handler.py
 # ==============================================================================
-RUN pip install --no-cache-dir "transformers>=4.47" "addict" "easydict" && \
+RUN pip install --no-cache-dir "transformers==4.46.3" "addict" "easydict" && \
     rm -rf /root/.cache/pip /tmp/*
 
 # ==============================================================================
