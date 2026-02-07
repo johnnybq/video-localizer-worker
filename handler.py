@@ -477,9 +477,12 @@ class ModelManager:
 
         elif name == "sam2":
             from sam2.sam2_video_predictor import SAM2VideoPredictor
-            return SAM2VideoPredictor.from_pretrained(
+            predictor = SAM2VideoPredictor.from_pretrained(
                 "facebook/sam2.1-hiera-large"
             )
+            # Force Float32 to avoid BFloat16/Float32 dtype mismatch during propagation
+            predictor.float()
+            return predictor
 
         elif name == "faster_whisper":
             from faster_whisper import WhisperModel
@@ -693,7 +696,7 @@ def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     detections = []
-    sample_rate = max(1, int(fps / 2))  # 2 fps sampling
+    sample_rate = max(1, int(fps))  # 1 fps sampling (DeepSeek-OCR-2 is ~10-28s/frame)
 
     # Regex for grounding output: <|ref|>label<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>
     det_pattern = re.compile(r'<\|ref\|>([^<]*)<\|/ref\|><\|det\|>([^<]*)<\|/det\|>')
@@ -728,7 +731,12 @@ def _detect_text_deepseek(video_path: str, mm: ModelManager) -> Dict:
 
                 # res is the raw model output string with <|ref|>/<|det|> tags
                 if not res or not isinstance(res, str):
+                    logger.warning(f"DeepSeek-OCR frame {i}: res is {type(res).__name__}, value={repr(res)[:200]}")
                     continue
+
+                # Log first frame's output for debugging
+                if i == 0 or (i > 0 and not detections):
+                    logger.info(f"DeepSeek-OCR frame {i}: res type={type(res).__name__}, len={len(res)}, first200={repr(res[:200])}")
 
                 # Parse grounding tags (cap at 50 per frame to avoid hallucinations)
                 frame_dets = 0
@@ -2416,7 +2424,17 @@ def stage_assemble(
     logger.info("Stage: ASSEMBLE")
 
     if not tts_audio:
-        raise RuntimeError("No TTS audio available — cannot assemble localized video")
+        # Speechless video — just copy video with original audio (text-only localization)
+        logger.info("No TTS audio — assembling with original audio only")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-c", "copy",
+            output_path
+        ], capture_output=True, check=False)
+        if not os.path.exists(output_path):
+            raise RuntimeError(f"ffmpeg assemble (no-TTS) failed — output not created: {output_path}")
+        return output_path
 
     if background_audio and os.path.exists(background_audio):
         # Mix TTS voice with background audio
