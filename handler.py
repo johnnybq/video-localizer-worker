@@ -297,9 +297,12 @@ class JobConfig:
     # Original subtitle style from Gemini manifest (font, color, background, etc.)
     subtitle_style: Optional[Dict] = None
 
-    # Pre-cloned ElevenLabs voice ID (from server-side caching)
-    # If provided, skips per-call voice cloning and uses this voice directly
+    # Persisted ElevenLabs voice ID (from campaign)
+    # If provided, reuses this voice instead of cloning each time
     elevenlabs_voice_id: Optional[str] = None
+
+    # Campaign ID for voice naming (traceability)
+    campaign_id: Optional[int] = None
 
     # Adaptive pipeline config from server (VideoProfile)
     video_profile: Optional[Dict] = None
@@ -1794,15 +1797,15 @@ def stage_blur_plate(video_path: str, regions: List[Dict], video_profile: dict =
         w = max(w, 10)
         h = max(h, 10)
 
-        # Adaptive blur radius — must be <= min(w,h)/2 for boxblur
-        blur_radius = max(2, min(25, min(w, h) // 2 - 1))
+        # Use gblur (gaussian blur) — more robust than boxblur, no radius constraints
+        blur_sigma = max(5, min(30, min(w, h) // 4))
 
         # Create blur+darken filter for this region
-        # crop → boxblur → darken (eq) → overlay at original position
+        # crop → gblur → darken (eq) → overlay at original position
         filter_parts.append(
             f"{current_input}split[main{i}][blur_src{i}];"
             f"[blur_src{i}]crop={w}:{h}:{x}:{y},"
-            f"boxblur=luma_radius={blur_radius}:luma_power=3,"
+            f"gblur=sigma={blur_sigma},"
             f"eq=brightness=-0.3:saturation=0.5"
             f"[blurred{i}];"
             f"[main{i}][blurred{i}]overlay={x}:{y}[out{i}]"
@@ -2137,6 +2140,29 @@ def _estimate_text_height(text: str, font_size: int, box_width: int) -> int:
         else:
             current_line_len += len(word) + 1
     return int(lines * font_size * 1.3)  # 1.3 line spacing
+
+
+def _strip_emoji(text: str) -> str:
+    """Strip emoji characters from text — ASS/libass can't render color emoji glyphs."""
+    import re
+    # Remove all Unicode emoji ranges (emoticons, symbols, dingbats, etc.)
+    emoji_pattern = re.compile(
+        "[\U0001F600-\U0001F64F"  # Emoticons
+        "\U0001F300-\U0001F5FF"   # Symbols & pictographs
+        "\U0001F680-\U0001F6FF"   # Transport & map
+        "\U0001F1E0-\U0001F1FF"   # Flags
+        "\U00002702-\U000027B0"   # Dingbats
+        "\U000024C2-\U0001F251"   # Enclosed chars
+        "\U0001F900-\U0001F9FF"   # Supplemental
+        "\U0001FA00-\U0001FA6F"   # Chess symbols
+        "\U0001FA70-\U0001FAFF"   # Extended-A
+        "\U00002600-\U000026FF"   # Misc symbols
+        "\U0000FE00-\U0000FE0F"   # Variation selectors
+        "\U0000200D"              # Zero-width joiner
+        "\U00000023\U0000FE0F\U000020E3"  # Keycap #
+        "]+", flags=re.UNICODE
+    )
+    return emoji_pattern.sub("", text).strip()
 
 
 def _wrap_text_for_ass(text: str, max_chars_per_line: int = 25) -> str:
@@ -2690,10 +2716,10 @@ def _render_subtitle_snap(ass_lines: list, overlay: Dict, region: Dict, video_wi
     cs = dict(caption_style or CAPTION_STYLE_PRESETS["dubbed_strip"])
     bbox = region.get("bbox_norm", [0, 0.85, 1, 1])
 
-    # subtitle_snap does NOT remove original text — background MUST be opaque
-    # bg_alpha in ASS convention: 0.0=opaque, 1.0=transparent
-    # Force max 15% transparency (= min 85% opaque) to cover source text
-    cs["bg_alpha"] = min(cs.get("bg_alpha", 0.15), 0.15)
+    # subtitle_snap does NOT remove original text — background MUST be fully opaque
+    # bg_alpha in ASS convention: 0.0=fully opaque, 1.0=fully transparent
+    # Force 0% transparency (= 100% opaque) — must completely cover source text
+    cs["bg_alpha"] = 0.0
 
     # Convert to pixels — full width strip for clean subtitle look
     x1 = 0
@@ -2725,7 +2751,7 @@ def _render_subtitle_snap(ass_lines: list, overlay: Dict, region: Dict, video_wi
     )
 
     # Layer 1: Translated text with market-native styling
-    translated_text = overlay.get("translated_text", "")
+    translated_text = _strip_emoji(overlay.get("translated_text", ""))
     max_chars = cs.get("max_chars_line", 32)
     wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=max_chars)
     safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
@@ -2748,7 +2774,7 @@ def _render_subtitle_snap(ass_lines: list, overlay: Dict, region: Dict, video_wi
 
     logger.info(
         f"SUBTITLE_SNAP: region={region.get('id', '?')} "
-        f"strip=({x1},{y1},{x2},{y2}) style={cs.get('_preset_name', '?')} "
+        f"strip=({x1},{y1},{x2},{y2}) alpha=0x{int(cs['bg_alpha']*255):02X} "
         f"text='{translated_text[:30]}'"
     )
 
@@ -2776,7 +2802,7 @@ def _render_blur_plate_overlay(ass_lines: list, overlay: Dict, region: Dict, vid
     start_time = _format_ass_time(overlay.get("appears_at", 0))
     end_time = _format_ass_time(overlay.get("disappears_at", 0))
 
-    translated_text = overlay.get("translated_text", "")
+    translated_text = _strip_emoji(overlay.get("translated_text", ""))
     max_chars = cs.get("max_chars_line", 28)
     wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=max_chars)
     safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
@@ -2792,13 +2818,13 @@ def _render_blur_plate_overlay(ass_lines: list, overlay: Dict, region: Dict, vid
             pass
         style_name = "TranslatedTextRTL"
 
-    # Layer 0: Semi-opaque backup background in case blur failed or is insufficient
+    # Layer 0: Opaque backup background — MUST cover original text even if blur failed
     bg_color_ass = _hex_to_ass_color(cs.get("bg_color", "#0A0A0A"))
-    # 60% opaque backup (ASS: 0x66 = ~40% = 60% opaque)
+    # 95% opaque backup (ASS: 0x0D = 5% transparent)
     draw_cmd = f"m {x1} {y1} l {x2} {y1} l {x2} {y2} l {x1} {y2}"
     ass_lines.append(
         f"Dialogue: 0,{start_time},{end_time},BackPlate,,0,0,0,,"
-        f"{{\\an7\\pos(0,0)\\1c{bg_color_ass}\\1a&H66\\bord0\\shad0\\p1}}{draw_cmd}"
+        f"{{\\an7\\pos(0,0)\\1c{bg_color_ass}\\1a&H0D\\bord0\\shad0\\p1}}{draw_cmd}"
     )
 
     # Layer 1: Text with shadow for readability on blurred background
@@ -2810,7 +2836,7 @@ def _render_blur_plate_overlay(ass_lines: list, overlay: Dict, region: Dict, vid
 
     logger.info(
         f"BLUR_PLATE_OVERLAY: region={region.get('id', '?')} "
-        f"pos=({cx},{cy}) style={cs.get('_preset_name', '?')} "
+        f"pos=({cx},{cy}) alpha=0x0D "
         f"text='{translated_text[:30]}'"
     )
 
@@ -2903,7 +2929,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     ass_lines = []  # Collect dialogue lines
 
     for i, overlay in enumerate(translated_overlays):
-        translated_text = overlay.get("translated_text", "")
+        translated_text = _strip_emoji(overlay.get("translated_text", ""))
         if not translated_text:
             continue
 
@@ -3189,12 +3215,17 @@ def stage_translate(text: str, source_lang: str, target_lang: str) -> str:
     )
 
 
-def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en", voice_id: Optional[str] = None) -> Optional[str]:
+def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en",
+                    voice_id: Optional[str] = None, campaign_id: Optional[int] = None) -> Optional[Tuple[str, str]]:
     """Generate speech using ElevenLabs API (best quality, runs from GPU worker IP to avoid geo-blocks).
 
     Args:
-        voice_id: Pre-cloned voice ID from server. If provided, skips cloning and
-                  does NOT delete the voice (server handles cleanup).
+        voice_id: Pre-cloned voice ID. If provided, skips cloning and reuses the voice.
+        campaign_id: Campaign ID for naming the cloned voice (for traceability).
+
+    Returns:
+        Tuple of (audio_path, voice_id) or None if failed.
+        voice_id is returned so server can persist it for future reuse.
     """
     api_key = os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
@@ -3204,19 +3235,19 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
     import httpx
 
     output_path = tempfile.mktemp(suffix=".mp3")
-    locally_cloned = False  # Track whether we cloned locally (for cleanup)
 
     try:
-        # Step 1: Use pre-cloned voice or create a new clone
+        # Step 1: Use persisted voice or create a new clone
         if voice_id:
-            logger.info(f"ElevenLabs: using pre-cloned voice {voice_id}")
+            logger.info(f"ElevenLabs: reusing persisted voice {voice_id}")
         else:
-            logger.info("ElevenLabs: cloning voice from reference audio...")
+            voice_name = f"tp_campaign_{campaign_id}" if campaign_id else "tp_clone_temp"
+            logger.info(f"ElevenLabs: cloning voice as '{voice_name}' from reference audio...")
             with open(reference_audio, "rb") as f:
                 clone_resp = httpx.post(
                     "https://api.elevenlabs.io/v1/voices/add",
                     headers={"xi-api-key": api_key},
-                    data={"name": "clone_temp", "description": "Temporary clone for localization"},
+                    data={"name": voice_name, "description": f"TrafficPlant voice clone (campaign={campaign_id})"},
                     files={"files": ("reference.wav", f, "audio/wav")},
                     timeout=30,
                 )
@@ -3229,8 +3260,8 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
                 logger.warning("ElevenLabs: no voice_id returned")
                 return None
 
-            locally_cloned = True
-            logger.info(f"ElevenLabs: voice cloned as {voice_id}")
+            # Don't delete — server will persist this voice_id for reuse
+            logger.info(f"ElevenLabs: voice cloned as {voice_id} (persisted, not deleting)")
 
         # Step 2: Generate speech with cloned voice
         try:
@@ -3267,20 +3298,11 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
                 out.write(tts_resp.content)
 
             logger.info(f"ElevenLabs: generated {len(tts_resp.content)} bytes of audio")
-            return output_path
+            return output_path, voice_id
 
-        finally:
-            # Step 3: Delete voice clone ONLY if we created it locally
-            if locally_cloned and voice_id:
-                try:
-                    httpx.delete(
-                        f"https://api.elevenlabs.io/v1/voices/{voice_id}",
-                        headers={"xi-api-key": api_key},
-                        timeout=10,
-                    )
-                    logger.info(f"ElevenLabs: deleted temp voice {voice_id}")
-                except Exception:
-                    pass
+        except Exception as e:
+            logger.warning(f"ElevenLabs TTS generation failed: {e}")
+            return None
 
     except Exception as e:
         logger.warning(f"ElevenLabs failed: {e}")
@@ -3305,19 +3327,22 @@ def _tts_f5(text: str, reference_audio: str, mm: ModelManager) -> str:
     return output_path
 
 
-def stage_tts(text: str, reference_audio: str, mm: ModelManager, target_language: str = "en", voice_id: Optional[str] = None) -> Tuple[str, str]:
+def stage_tts(text: str, reference_audio: str, mm: ModelManager, target_language: str = "en",
+              voice_id: Optional[str] = None, campaign_id: Optional[int] = None) -> Tuple[str, str, Optional[str]]:
     """Generate speech: ElevenLabs API (primary) → F5-TTS local (fallback).
-    Returns: (audio_path, method_used)
+    Returns: (audio_path, method_used, voice_id_for_persistence)
     """
-    logger.info(f"Stage: TTS (target_language={target_language}, voice_id={'yes' if voice_id else 'no'})")
+    logger.info(f"Stage: TTS (target_language={target_language}, voice_id={'reuse' if voice_id else 'clone'}, campaign={campaign_id})")
 
     # Primary: ElevenLabs (runs from US GPU IP — no geo-block)
-    result = _tts_elevenlabs(text, reference_audio, target_language=target_language, voice_id=voice_id)
+    result = _tts_elevenlabs(text, reference_audio, target_language=target_language,
+                             voice_id=voice_id, campaign_id=campaign_id)
     if result:
-        return result, "elevenlabs"
+        audio_path, used_voice_id = result
+        return audio_path, "elevenlabs", used_voice_id
 
-    # Fallback: F5-TTS on local GPU
-    return _tts_f5(text, reference_audio, mm), "f5tts"
+    # Fallback: F5-TTS on local GPU (no voice persistence)
+    return _tts_f5(text, reference_audio, mm), "f5tts", None
 
 
 def stage_lipsync(video_path: str, audio_path: str, quality: str, mm: ModelManager) -> str:
@@ -3716,7 +3741,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             translated_text=job_input.get("translated_text"),  # Pre-translated from server
             translated_overlays=job_input.get("translated_overlays"),  # Pre-translated text overlays
             subtitle_style=job_input.get("subtitle_style"),  # Original subtitle style from manifest
-            elevenlabs_voice_id=job_input.get("elevenlabs_voice_id"),  # Pre-cloned voice ID
+            elevenlabs_voice_id=job_input.get("elevenlabs_voice_id"),  # Persisted voice ID
+            campaign_id=job_input.get("campaign_id"),  # For voice naming
             video_profile=job_input.get("video_profile"),  # Adaptive pipeline config
             target_caption_style=job_input.get("target_caption_style"),  # Gemini-generated caption style
         )
@@ -3926,14 +3952,16 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
                 elif stage_name == "tts":
                     if config.voice_clone and state.get("translated_text"):
-                        tts_result, tts_method = stage_tts(
+                        tts_result, tts_method, used_voice_id = stage_tts(
                             state["translated_text"],
                             state.get("vocals_path") or video_path,
                             mm,
                             target_language=config.target_language,
                             voice_id=config.elevenlabs_voice_id,
+                            campaign_id=config.campaign_id,
                         )
                         state["tts_audio"] = tts_result
+                        state["cloned_voice_id"] = used_voice_id
                         metrics.methods_used["tts"] = tts_method
                     elif not state.get("translated_text"):
                         raise RuntimeError("No translated text available for TTS")
@@ -4024,12 +4052,16 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Errors: {len(metrics.errors)} (non-critical)")
         logger.info(f"=" * 60)
 
-        return {
+        result = {
             "status": "success",
             "output_url": output_url,
             "metrics": metrics.to_dict(),
-            "transcript": state.get("transcript")
+            "transcript": state.get("transcript"),
         }
+        # Return cloned voice_id so server can persist it for future reuse
+        if state.get("cloned_voice_id"):
+            result["cloned_voice_id"] = state["cloned_voice_id"]
+        return result
 
     except Exception as e:
         logger.error(f"Job {job_id} failed: {e}")
