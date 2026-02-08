@@ -42,7 +42,7 @@ PROGRESS_URL = f"{BACKEND_URL}/api/sota/worker/progress"
 
 WORKER_ID = os.environ.get("WORKER_ID", f"vast-{uuid.uuid4().hex[:8]}")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))         # seconds between polls
-IDLE_SHUTDOWN_SECS = int(os.environ.get("IDLE_SHUTDOWN", "3600"))  # shutdown after N idle seconds (1 hour default)
+IDLE_SHUTDOWN_SECS = int(os.environ.get("IDLE_SHUTDOWN", "0"))  # 0 = never shutdown (keep polling forever)
 
 # =============================================================================
 # Import Handler Logic
@@ -296,13 +296,14 @@ def main():
             continue
 
         elif poll_result.get("status") == "idle":
-            idle_elapsed = time.time() - idle_since
-            if idle_elapsed > IDLE_SHUTDOWN_SECS:
-                log.info(
-                    f"No tasks for {IDLE_SHUTDOWN_SECS}s — shutting down. "
-                    f"Completed {tasks_completed} task(s) this session."
-                )
-                break
+            if IDLE_SHUTDOWN_SECS > 0:
+                idle_elapsed = time.time() - idle_since
+                if idle_elapsed > IDLE_SHUTDOWN_SECS:
+                    log.info(
+                        f"No tasks for {IDLE_SHUTDOWN_SECS}s — shutting down. "
+                        f"Completed {tasks_completed} task(s) this session."
+                    )
+                    break
 
         elif poll_result.get("status") == "error":
             # Backend unreachable — back off longer
