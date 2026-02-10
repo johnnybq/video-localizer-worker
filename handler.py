@@ -71,12 +71,161 @@ import numpy as np
 # RTL (Right-to-Left) languages for subtitle rendering
 RTL_LANGUAGES = {"ar", "he", "fa", "ur", "yi"}
 
+# =============================================================================
+# Geo-Aware Font Map
+# =============================================================================
+# Maps language codes → (primary_font, fallback_font)
+# Primary fonts are Google Fonts downloaded at runtime; fallback fonts are
+# system fonts from Dockerfile.base packages (fonts-noto-core, fonts-noto-cjk,
+# fonts-dejavu-core, fonts-freefont-ttf).
+GEO_FONT_MAP = {
+    # Latin script — Google Fonts primary
+    "en": ("Montserrat", "DejaVu Sans"),
+    "es": ("Poppins", "DejaVu Sans"),
+    "pt": ("Poppins", "DejaVu Sans"),
+    "fr": ("Inter", "DejaVu Sans"),
+    "de": ("Inter", "DejaVu Sans"),
+    "it": ("Inter", "DejaVu Sans"),
+    "nl": ("Inter", "DejaVu Sans"),
+    "pl": ("Inter", "DejaVu Sans"),
+    "sv": ("Inter", "DejaVu Sans"),
+    "tr": ("Montserrat", "DejaVu Sans"),
+    "vi": ("Montserrat", "DejaVu Sans"),
+    "id": ("Montserrat", "DejaVu Sans"),
+    "sr-Latn": ("Montserrat", "DejaVu Sans"),
+    # Cyrillic script
+    "ru": ("Montserrat", "DejaVu Sans"),
+    "uk": ("Montserrat", "DejaVu Sans"),
+    "sr": ("Montserrat", "DejaVu Sans"),
+    # Arabic/RTL script — bundled via fonts-noto-core
+    "ar": ("Noto Sans Arabic", "Noto Sans Arabic"),
+    "fa": ("Noto Sans Arabic", "Noto Sans Arabic"),
+    "ur": ("Noto Sans Arabic", "Noto Sans Arabic"),
+    "he": ("Noto Sans Hebrew", "Noto Sans Hebrew"),
+    # CJK script — bundled via fonts-noto-cjk
+    "ja": ("Noto Sans JP", "Noto Sans CJK JP"),
+    "ko": ("Noto Sans KR", "Noto Sans CJK KR"),
+    "zh": ("Noto Sans SC", "Noto Sans CJK SC"),
+    "zh-CN": ("Noto Sans SC", "Noto Sans CJK SC"),
+    "zh-TW": ("Noto Sans TC", "Noto Sans CJK TC"),
+    # Indic scripts — bundled via fonts-noto-core
+    "hi": ("Noto Sans Devanagari", "Noto Sans Devanagari"),
+    "bn": ("Noto Sans Bengali", "Noto Sans Bengali"),
+    "ta": ("Noto Sans Tamil", "Noto Sans Tamil"),
+    "te": ("Noto Sans Telugu", "Noto Sans Telugu"),
+    # Thai
+    "th": ("Noto Sans Thai", "Noto Sans Thai"),
+}
+
+# Google Fonts that need downloading (not in system packages)
+_GOOGLE_FONTS_TO_DOWNLOAD = {
+    "Montserrat": "Montserrat:wght@400;700;800;900",
+    "Poppins": "Poppins:wght@400;600;700;800",
+    "Inter": "Inter:wght@400;500;600;700",
+}
+
+_FONT_DIR = Path("/workspace/fonts")
+_fonts_initialized = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _ensure_geo_fonts():
+    """
+    Download Google Fonts for geo-aware rendering and register with fontconfig.
+
+    Fonts are cached in /workspace/fonts/ which persists across Vast.ai runs.
+    Only downloads missing fonts — subsequent calls are no-ops.
+    """
+    global _fonts_initialized
+    if _fonts_initialized:
+        return
+
+    _FONT_DIR.mkdir(parents=True, exist_ok=True)
+    import re as _re_fonts
+
+    for family, url_spec in _GOOGLE_FONTS_TO_DOWNLOAD.items():
+        family_dir = _FONT_DIR / family.replace(" ", "_")
+        if family_dir.exists() and any(family_dir.glob("*.ttf")):
+            continue  # Already downloaded
+
+        family_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            api_url = f"https://fonts.googleapis.com/css2?family={url_spec}&display=swap"
+            result = subprocess.run(
+                ["curl", "-sL", "-H", "User-Agent: Mozilla/5.0", api_url],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                logger.warning(f"FONTS: Failed to fetch CSS for {family}: {result.stderr[:100]}")
+                continue
+
+            ttf_urls = _re_fonts.findall(r'url\((https://fonts\.gstatic\.com/[^)]+\.ttf)\)', result.stdout)
+            if not ttf_urls:
+                logger.warning(f"FONTS: No TTF URLs found for {family} (Google may serve woff2 only)")
+                continue
+
+            for i, url in enumerate(ttf_urls):
+                out_file = family_dir / f"{family.replace(' ', '_')}_{i}.ttf"
+                subprocess.run(
+                    ["curl", "-sL", "-o", str(out_file), url],
+                    capture_output=True, timeout=30,
+                )
+
+            ttf_count = len(list(family_dir.glob("*.ttf")))
+            logger.info(f"FONTS: Downloaded {ttf_count} TTF files for '{family}'")
+        except Exception as e:
+            logger.warning(f"FONTS: Error downloading {family}: {e}")
+
+    # Register /workspace/fonts/ with fontconfig so ffmpeg/libass can find them
+    fontconfig_file = Path("/etc/fonts/conf.d/99-trafficplant-fonts.conf")
+    if not fontconfig_file.exists():
+        try:
+            fontconfig_file.parent.mkdir(parents=True, exist_ok=True)
+            fontconfig_file.write_text(
+                '<?xml version="1.0"?>\n'
+                '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n'
+                '<fontconfig>\n'
+                f'  <dir>{_FONT_DIR}</dir>\n'
+                '</fontconfig>\n'
+            )
+            subprocess.run(["fc-cache", "-fv", str(_FONT_DIR)], capture_output=True, timeout=30)
+            logger.info(f"FONTS: Registered {_FONT_DIR} with fontconfig")
+        except Exception as e:
+            logger.warning(f"FONTS: Failed to register with fontconfig: {e}")
+
+    _fonts_initialized = True
+    logger.info("FONTS: Geo font initialization complete")
+
+
+def get_geo_font(target_language: str) -> str:
+    """Get the best available font family name for a target language."""
+    lang_base = normalize_language_code(target_language) if target_language else "en"
+    primary, fallback = GEO_FONT_MAP.get(lang_base, GEO_FONT_MAP.get("en", ("Montserrat", "DejaVu Sans")))
+
+    # Check if primary font was downloaded
+    family_dir = _FONT_DIR / primary.replace(" ", "_")
+    if family_dir.exists() and any(family_dir.glob("*.ttf")):
+        return primary
+
+    # Check system fontconfig
+    try:
+        result = subprocess.run(
+            ["fc-list", f":family={primary}", "family"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.stdout.strip():
+            return primary
+    except Exception:
+        pass
+
+    return fallback
+
 
 # Optional progress callback: called after each pipeline stage completes.
 # Signature: callback(stage_name: str, elapsed_secs: float, errors: list)
@@ -296,6 +445,9 @@ class JobConfig:
 
     # Original subtitle style from Gemini manifest (font, color, background, etc.)
     subtitle_style: Optional[Dict] = None
+
+    # Original transcript (source language) — used for TTS speed calculation
+    original_transcript: Optional[str] = None
 
     # Persisted ElevenLabs voice ID (from campaign)
     # If provided, reuses this voice instead of cloning each time
@@ -1033,33 +1185,50 @@ def _dedupe_detections(detections: List[Dict], iou_threshold: float = 0.5) -> Li
     """Remove duplicate detections based on spatial IoU + text similarity.
 
     Uses IoU > 0.5 (spatial overlap) AND Levenshtein > 0.6 (text similarity)
-    to identify duplicates. This avoids:
-    - Exact-match-only dedup missing OCR variants of same text
-    - Over-aggressive dedup removing distinct text at similar positions
+    to identify duplicates. Also tracks frame_count for temporal persistence filtering.
     """
     if not detections:
         return []
 
     unique = []
+    frame_counts = []  # Track how many source frames each unique detection appears in
     for det in detections:
         is_dupe = False
-        for existing in unique:
+        for idx, existing in enumerate(unique):
             iou = _calculate_iou(det["bbox_norm"], existing["bbox_norm"])
             if iou > iou_threshold:
                 # Spatial overlap — check text similarity
                 text_sim = _levenshtein_ratio(det.get("text", ""), existing.get("text", ""))
                 if text_sim > 0.6:
                     is_dupe = True
+                    frame_counts[idx] += 1
                     # Keep the one with higher confidence
                     if det.get("confidence", 0) > existing.get("confidence", 0):
-                        idx = unique.index(existing)
                         unique[idx] = det
                     break
         if not is_dupe:
             unique.append(det)
+            frame_counts.append(1)
 
-    logger.info(f"DEDUPE: {len(detections)} raw → {len(unique)} unique (IoU>{iou_threshold}, text_sim>0.6)")
-    return unique
+    # Temporal persistence filter: require detection in ≥2 frames
+    # Single-frame detections are likely false positives (noise, body parts, reflections)
+    filtered = []
+    rejected_count = 0
+    for det, fc in zip(unique, frame_counts):
+        if fc >= 2:
+            det["frame_count"] = fc
+            filtered.append(det)
+        else:
+            rejected_count += 1
+            logger.info(
+                f"DEDUPE: REJECTED single-frame detection text='{det.get('text', '')[:30]}' "
+                f"bbox_norm={[f'{v:.3f}' for v in det.get('bbox_norm', [])]} — likely false positive"
+            )
+
+    logger.info(f"DEDUPE: {len(detections)} raw → {len(unique)} unique → {len(filtered)} persistent (IoU>{iou_threshold}, text_sim>0.6, min_frames=2)")
+    if rejected_count:
+        logger.info(f"DEDUPE: Rejected {rejected_count} single-frame detections")
+    return filtered
 
 
 def _calculate_iou(box1: List[float], box2: List[float]) -> float:
@@ -1297,8 +1466,9 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
 
     Returns:
         Tuple of (video_path, inpaint_succeeded)
-        - inpaint_succeeded=True: Text was removed OR no text detected, eraser plate optional
-        - inpaint_succeeded=False: Text detected but NOT removed, eraser plate REQUIRED
+        - inpaint_succeeded=True: Text was removed OR no text detected
+        - inpaint_succeeded=False: Text detected but NOT removed; watermarks get eraser
+          plates, non-watermark regions fall through to styled overlays
     """
     config = pipeline_config or {}
     inpaint_strategies = config.get("inpaint_strategy", {})
@@ -1317,14 +1487,27 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
     if mask_path is None:
         if detections:
             # Text WAS detected by OCR but mask creation failed (e.g. SAM2 all-black)
-            # Original text is still visible — eraser plate REQUIRED
-            logger.warning(
-                f"INPAINT: mask_path is None but {len(detections)} text detections exist. "
-                f"SAM2 mask failed — eraser plate REQUIRED to cover original text."
+            # Only watermark/logo regions need eraser plates (black rectangles).
+            # Non-watermark regions (captions, subtitles, usernames) fall through
+            # to styled overlay rendering — black rectangles look worse than original text.
+            has_watermark_regions = any(
+                r.get("type", "").lower() in ("watermark", "logo")
+                for r in text_regions
             )
+            if has_watermark_regions:
+                logger.warning(
+                    f"INPAINT: mask_path is None but {len(detections)} text detections exist. "
+                    f"SAM2 mask failed — eraser plate REQUIRED for watermark regions only."
+                )
+                mm.metrics.methods_used["inpaint"] = "eraser_plate_watermarks_only"
+            else:
+                logger.warning(
+                    f"INPAINT: mask_path is None but {len(detections)} text detections exist. "
+                    f"SAM2 mask failed — no watermarks, styled overlays will cover text."
+                )
+                mm.metrics.methods_used["inpaint"] = "skipped_overlay_fallback"
             if errors is not None:
                 errors.append("inpaint: mask creation failed (SAM2 all-black), text not removed")
-            mm.metrics.methods_used["inpaint"] = "eraser_plate_only"
             return video_path, False
         else:
             # No text detected at all — legitimate skip, no eraser needed
@@ -1344,7 +1527,7 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
         for region in text_regions:
             rid = region.get("id", "")
             if inpaint_strategies.get(rid) == "videopainter":
-                bbox = region.get("bbox_norm", [0, 0, 1, 1])
+                bbox = _normalize_bbox(region.get("bbox_norm", [0, 0, 1, 1]))
                 vp_y_ranges.append((bbox[1], bbox[3]))
 
         if vp_y_ranges:
@@ -1390,40 +1573,65 @@ def stage_inpaint(video_path: str, mask_path: str, mm: ModelManager, errors: Opt
                 )
                 mask_path = pruned_path  # Use pruned mask for inpainting
 
-    # Try VideoPainter first (best quality, CogVideoX-based)
-    try:
-        logger.info("INPAINT: Attempting VideoPainter (CogVideoX-based)...")
-        with mm.use("videopainter") as videopainter:
-            result = _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
-            logger.info("INPAINT: VideoPainter succeeded!")
-            mm.metrics.methods_used["inpaint"] = "videopainter"
-            return result, True
-    except Exception as e:
-        import traceback
-        err_msg = f"VideoPainter failed: {e}"
-        logger.warning(err_msg)
-        logger.warning(f"VideoPainter traceback:\n{traceback.format_exc()}")
-        all_errors.append(err_msg)
+    # Determine video orientation — ProPainter preserves resolution, VideoPainter downsamples to ~480p
+    import cv2 as _cv2_orient
+    _cap = _cv2_orient.VideoCapture(video_path)
+    _vw = int(_cap.get(_cv2_orient.CAP_PROP_FRAME_WIDTH))
+    _vh = int(_cap.get(_cv2_orient.CAP_PROP_FRAME_HEIGHT))
+    _cap.release()
+    is_vertical = _vh > _vw
 
-    # Fallback to ProPainter
-    try:
-        logger.info("INPAINT: Attempting ProPainter fallback...")
-        result = _inpaint_propainter(video_path, mask_path, output_path)
-        logger.info("INPAINT: ProPainter succeeded!")
-        mm.metrics.methods_used["inpaint"] = "propainter"
-        return result, True
-    except Exception as e:
-        import traceback
-        err_msg = f"ProPainter failed: {e}"
-        logger.error(err_msg)
-        logger.warning(f"ProPainter traceback:\n{traceback.format_exc()}")
-        all_errors.append(err_msg)
+    # For vertical video: ProPainter first (preserves resolution), VideoPainter as fallback
+    # For landscape: VideoPainter first (better inpainting quality when resolution isn't destroyed)
+    if is_vertical:
+        logger.info(f"INPAINT: Vertical video ({_vw}x{_vh}) — using ProPainter first (preserves resolution)")
+        inpaint_order = [
+            ("propainter", _inpaint_propainter, [video_path, mask_path, output_path]),
+            ("videopainter", None, None),  # Fallback, needs mm context
+        ]
+    else:
+        logger.info(f"INPAINT: Landscape video ({_vw}x{_vh}) — using VideoPainter first")
+        inpaint_order = [
+            ("videopainter", None, None),
+            ("propainter", _inpaint_propainter, [video_path, mask_path, output_path]),
+        ]
 
-    # All methods failed - eraser plate is now REQUIRED
+    for method_name, method_fn, method_args in inpaint_order:
+        try:
+            if method_name == "videopainter":
+                logger.info("INPAINT: Attempting VideoPainter (CogVideoX-based)...")
+                with mm.use("videopainter") as videopainter:
+                    result = _inpaint_videopainter(video_path, mask_path, output_path, videopainter)
+                    logger.info("INPAINT: VideoPainter succeeded!")
+                    mm.metrics.methods_used["inpaint"] = "videopainter"
+                    return result, True
+            else:
+                logger.info(f"INPAINT: Attempting ProPainter...")
+                result = _inpaint_propainter(video_path, mask_path, output_path)
+                logger.info("INPAINT: ProPainter succeeded!")
+                mm.metrics.methods_used["inpaint"] = "propainter"
+                return result, True
+        except Exception as e:
+            import traceback
+            err_msg = f"{method_name} failed: {e}"
+            logger.warning(err_msg)
+            logger.warning(f"{method_name} traceback:\n{traceback.format_exc()}")
+            all_errors.append(err_msg)
+
+    # All methods failed — check if any regions are watermarks
+    # Only watermarks get eraser plates; non-watermark content uses styled overlays
     combined_error = f"inpaint: ALL methods failed - {'; '.join(all_errors)}"
     logger.error(combined_error)
-    logger.warning("INPAINT: Falling back to ERASER-PLATE-ONLY mode (original text NOT removed)")
-    mm.metrics.methods_used["inpaint"] = "eraser_plate_only"
+    has_watermark_regions = any(
+        r.get("type", "").lower() in ("watermark", "logo")
+        for r in text_regions
+    )
+    if has_watermark_regions:
+        logger.warning("INPAINT: Eraser plates enabled for WATERMARK regions only (original text NOT removed)")
+        mm.metrics.methods_used["inpaint"] = "eraser_plate_watermarks_only"
+    else:
+        logger.warning("INPAINT: No watermarks — styled overlays will cover text (no eraser plates)")
+        mm.metrics.methods_used["inpaint"] = "failed_overlay_fallback"
     if errors is not None:
         errors.append(combined_error)
 
@@ -1733,9 +1941,24 @@ def _inpaint_videopainter(video_path: str, mask_path: str, output_path: str, pip
         if chunk_end >= len(video_frames):
             break
 
-    # Write output video
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    # Write output video using ffmpeg pipe (h.264) instead of cv2.VideoWriter (mp4v)
+    # mp4v codec produces macroblocking/datamoshing artifacts; h.264 is much higher quality
+    logger.info(f"VideoPainter: Writing {len(all_output_frames)} frames via ffmpeg pipe (h.264, {width}x{height} @ {fps:.1f}fps)")
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{width}x{height}",
+        "-pix_fmt", "bgr24",
+        "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+    ffproc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     for frame in all_output_frames:
         if isinstance(frame, Image.Image):
@@ -1744,9 +1967,14 @@ def _inpaint_videopainter(video_path: str, mask_path: str, output_path: str, pip
             frame = (frame * 255).clip(0, 255).astype(np.uint8)
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame.shape[-1] == 3 else frame
         frame_resized = cv2.resize(frame_bgr, (width, height))
-        out.write(frame_resized)
+        ffproc.stdin.write(frame_resized.tobytes())
 
-    out.release()
+    ffproc.stdin.close()
+    ffproc.wait(timeout=120)
+    if ffproc.returncode != 0:
+        stderr = ffproc.stderr.read().decode()[-500:]
+        logger.error(f"VideoPainter: ffmpeg pipe failed (rc={ffproc.returncode}): {stderr}")
+        raise RuntimeError(f"VideoPainter ffmpeg encoding failed: {stderr}")
 
     # Copy original audio to inpainted video
     _copy_audio(video_path, output_path)
@@ -1784,21 +2012,23 @@ def stage_blur_plate(video_path: str, regions: List[Dict], video_profile: dict =
     current_input = "[0:v]"
 
     for i, region in enumerate(regions):
-        bbox = region.get("bbox_norm", [0, 0.85, 1, 1])  # Default: bottom strip
+        bbox = _normalize_bbox(region.get("bbox_norm", [0, 0.85, 1, 1]), vid_w, vid_h)
 
-        # Convert normalized bbox to pixels with padding
-        pad = 5  # pixels
-        x = max(0, int(bbox[0] * vid_w) - pad)
-        y = max(0, int(bbox[1] * vid_h) - pad)
-        w = min(vid_w - x, int((bbox[2] - bbox[0]) * vid_w) + 2 * pad)
-        h = min(vid_h - y, int((bbox[3] - bbox[1]) * vid_h) + 2 * pad)
+        # Convert normalized bbox to pixels with generous padding
+        # V5: Gemini bboxes are approximate — extra padding prevents text bleed-through
+        pad_x = max(25, int((bbox[2] - bbox[0]) * vid_w * 0.15))  # 15% of bbox width, min 25px
+        pad_y = max(20, int((bbox[3] - bbox[1]) * vid_h * 0.20))  # 20% of bbox height, min 20px
+        x = max(0, int(bbox[0] * vid_w) - pad_x)
+        y = max(0, int(bbox[1] * vid_h) - pad_y)
+        w = min(vid_w - x, int((bbox[2] - bbox[0]) * vid_w) + 2 * pad_x)
+        h = min(vid_h - y, int((bbox[3] - bbox[1]) * vid_h) + 2 * pad_y)
 
         # Ensure minimum dimensions
         w = max(w, 10)
         h = max(h, 10)
 
-        # Use gblur (gaussian blur) — more robust than boxblur, no radius constraints
-        blur_sigma = max(5, min(30, min(w, h) // 4))
+        # Use gblur (gaussian blur) — strong enough to fully obscure text
+        blur_sigma = max(15, min(40, min(w, h) // 3))
 
         # Create blur+darken filter for this region
         # crop → gblur → darken (eq) → overlay at original position
@@ -1950,11 +2180,12 @@ def _find_overlay_bbox(
             y_bottom = bbox[3]
 
             in_correct_zone = False
-            if position == "top" and y_bottom < 0.45:  # Allow slightly more tolerance
+            pos_lower = position.lower()
+            if pos_lower.startswith("top") and y_bottom < 0.45:
                 in_correct_zone = True
-            elif position == "bottom" and y_top > 0.55:
+            elif pos_lower.startswith("bottom") and y_top > 0.55:
                 in_correct_zone = True
-            elif position in ("middle", "center") and y_top < 0.65 and y_bottom > 0.35:
+            elif pos_lower in ("middle", "center") and y_top < 0.65 and y_bottom > 0.35:
                 in_correct_zone = True
 
             if not in_correct_zone:
@@ -2005,11 +2236,12 @@ def _find_overlay_bbox(
         y_bottom = bbox[3]  # Bottom edge of detection
 
         # Check if bbox is ENTIRELY within zone (not just center)
-        if position == "top" and y_bottom < 0.40:  # Entire bbox in top 40%
+        pos_lower = position.lower()
+        if pos_lower.startswith("top") and y_bottom < 0.40:  # Entire bbox in top 40%
             filtered.append(d)
-        elif position == "bottom" and y_top > 0.60:  # Entire bbox in bottom 40%
+        elif pos_lower.startswith("bottom") and y_top > 0.60:  # Entire bbox in bottom 40%
             filtered.append(d)
-        elif position in ("middle", "center"):
+        elif pos_lower in ("middle", "center"):
             # Any overlap with middle zone (0.40-0.60)
             if y_top < 0.60 and y_bottom > 0.40:
                 filtered.append(d)
@@ -2105,7 +2337,8 @@ def _find_overlay_bbox(
     # ═══════════════════════════════════════════════════════════════════════
     # STEP 5: Fallback for top/bottom (skip middle/center entirely)
     # ═══════════════════════════════════════════════════════════════════════
-    if position in ("middle", "center"):
+    pos_lower = position.lower()
+    if pos_lower in ("middle", "center"):
         logger.warning(
             f"RENDER_TEXT: No OCR in zone '{position}' — skipping (would obscure content)"
         )
@@ -2118,9 +2351,9 @@ def _find_overlay_bbox(
     box_w = int(video_width * 0.70)
     box_h = int(video_height * 0.08)
 
-    if position == "top":
+    if pos_lower.startswith("top"):
         y = int(video_height * 0.03)
-    else:  # bottom
+    else:  # bottom, bottom_right, bottom_left, etc.
         y = int(video_height * 0.85)
 
     return (margin, y, box_w, box_h)
@@ -2140,6 +2373,32 @@ def _estimate_text_height(text: str, font_size: int, box_width: int) -> int:
         else:
             current_line_len += len(word) + 1
     return int(lines * font_size * 1.3)  # 1.3 line spacing
+
+
+def _normalize_bbox(bbox: list, video_width: int = 1920, video_height: int = 1080) -> list:
+    """Normalize bbox values to 0.0-1.0 range.
+
+    Gemini sometimes returns mixed coordinates: x as 0-1 normalized, y as pixel values.
+    Detect and fix any value > 1.0 by dividing by the appropriate dimension.
+    """
+    if not bbox or len(bbox) < 4:
+        return [0, 0.85, 1, 1]
+    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    # If any value > 1.5, treat it as pixel coordinate and normalize
+    if x1 > 1.5:
+        x1 /= video_width
+    if x2 > 1.5:
+        x2 /= video_width
+    if y1 > 1.5:
+        y1 /= video_height
+    if y2 > 1.5:
+        y2 /= video_height
+    # Clamp to 0-1
+    x1 = max(0.0, min(1.0, x1))
+    y1 = max(0.0, min(1.0, y1))
+    x2 = max(0.0, min(1.0, x2))
+    y2 = max(0.0, min(1.0, y2))
+    return [x1, y1, x2, y2]
 
 
 def _strip_emoji(text: str) -> str:
@@ -2218,6 +2477,476 @@ def _hex_to_ass_color(hex_color: str, alpha: float = 0.0) -> str:
     return f"&H{a:02X}{b:02X}{g:02X}{r:02X}"
 
 
+def _is_light_hex_color(hex_color: str) -> bool:
+    """Return True if a hex color is visually light (and bad for subtitle backplates)."""
+    if not hex_color:
+        return False
+    hc = hex_color.strip().lstrip("#")
+    if len(hc) == 3:
+        hc = "".join(ch * 2 for ch in hc)
+    if len(hc) != 6:
+        return False
+    try:
+        r = int(hc[0:2], 16)
+        g = int(hc[2:4], 16)
+        b = int(hc[4:6], 16)
+    except ValueError:
+        return False
+    # Relative luminance approximation (0..255)
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return luminance > 145
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """Best-effort integer parsing with fallback."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    """Best-effort float parsing with fallback."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _density_from_max_chars(max_chars: int) -> str:
+    """Map max chars per line to coarse text density."""
+    if max_chars <= 20:
+        return "compact"
+    if max_chars >= 30:
+        return "airy"
+    return "balanced"
+
+
+def _coerce_container_pref(value: Any, fallback: str = "pill") -> str:
+    """Normalize free-form container preference values."""
+    pref = str(value or "").strip().lower()
+    if pref in ("pill", "rounded_pill", "round_pill"):
+        return "pill"
+    if pref in ("box", "boxed", "rect", "rectangle"):
+        return "box"
+    if pref in ("strip", "bar", "band"):
+        return "strip"
+    if pref in ("none", "transparent", "text_only"):
+        return "none"
+    return fallback
+
+
+def _extract_style_intent(
+    target_caption_style: Optional[Dict],
+    subtitle_style: Optional[Dict],
+    video_profile: Optional[Dict],
+    pipeline_type: str,
+) -> Dict[str, Any]:
+    """
+    Build a stable style intent from multiple sources.
+
+    Gemini style is treated as intent (what look to aim for), while rendering
+    policy later enforces hard guardrails.
+    """
+    account_profile = (video_profile or {}).get("account_style_profile", {}) or {}
+    intent = {
+        "container_preference": "pill" if pipeline_type in ("subtitle_snap", "blur_plate") else "none",
+        "density": "balanced",
+        "emphasis": "medium",
+        "motion": "none",
+        "source": "default",
+    }
+
+    # Account profile gives cross-video consistency baseline.
+    if isinstance(account_profile, dict):
+        if account_profile.get("container_preference"):
+            intent["container_preference"] = _coerce_container_pref(
+                account_profile.get("container_preference"), intent["container_preference"]
+            )
+            intent["source"] = "account_profile"
+        if account_profile.get("density") in ("compact", "balanced", "airy"):
+            intent["density"] = account_profile["density"]
+        if account_profile.get("emphasis") in ("low", "medium", "high"):
+            intent["emphasis"] = account_profile["emphasis"]
+        if account_profile.get("motion") in ("none", "fade", "pop"):
+            intent["motion"] = account_profile["motion"]
+
+    # Per-video Gemini suggestion can refine baseline.
+    if target_caption_style and isinstance(target_caption_style, dict):
+        intent["source"] = "gemini_target"
+        if target_caption_style.get("bg_style"):
+            intent["container_preference"] = _coerce_container_pref(
+                target_caption_style.get("bg_style"), intent["container_preference"]
+            )
+
+        max_chars = _safe_int(target_caption_style.get("max_chars_line"), 25)
+        if max_chars > 0:
+            intent["density"] = _density_from_max_chars(max_chars)
+
+        emphasis_score = 0
+        if bool(target_caption_style.get("bold", True)):
+            emphasis_score += 1
+        if _safe_int(target_caption_style.get("outline_width"), 0) >= 3:
+            emphasis_score += 1
+        if _safe_int(target_caption_style.get("shadow_depth"), 0) >= 2:
+            emphasis_score += 1
+        if emphasis_score >= 2:
+            intent["emphasis"] = "high"
+        elif emphasis_score <= 0:
+            intent["emphasis"] = "low"
+        else:
+            intent["emphasis"] = "medium"
+
+    # Original subtitle style is weaker signal, only fills gaps.
+    if subtitle_style and isinstance(subtitle_style, dict):
+        animation = str(subtitle_style.get("animation", "")).lower()
+        if intent["motion"] == "none" and animation in ("pop", "fade"):
+            intent["motion"] = animation
+        if not target_caption_style:
+            fw = str(subtitle_style.get("font_weight", "")).lower()
+            if fw in ("black", "extrabold", "bold"):
+                intent["emphasis"] = "high"
+
+    # Pipeline guardrails at intent level.
+    if pipeline_type == "subtitle_snap":
+        if intent["container_preference"] == "none":
+            intent["container_preference"] = "pill"
+    elif pipeline_type == "blur_plate":
+        # Blur already adds texture reduction, so avoid "strip" intent here.
+        if intent["container_preference"] == "strip":
+            intent["container_preference"] = "pill"
+
+    return intent
+
+
+def _build_layout_policy(
+    pipeline_type: str,
+    density: str = "balanced",
+    container_preference: str = "pill",
+) -> Dict[str, Any]:
+    """Deterministic layout caps used by renderers to prevent giant blocks."""
+    # Base for subtitle-like overlays
+    policy = {
+        "zone_caps": {
+            "top": {"width": 0.70, "height": 0.16},
+            "middle": {"width": 0.60, "height": 0.22},
+            "bottom": {"width": 0.70, "height": 0.16},
+        },
+        "cover_pad_x_ratio": 0.08,
+        "cover_pad_y_ratio": 0.12,
+        "cover_pad_x_min": 8,
+        "cover_pad_y_min": 8,
+        "text_bias_w_ratio": 1.6,
+        "text_bias_h_ratio": 1.2,
+    }
+
+    if pipeline_type == "blur_plate":
+        # Slightly wider/shorter allowed on blur plate.
+        policy["zone_caps"]["top"]["width"] = 0.78
+        policy["zone_caps"]["middle"]["width"] = 0.70
+        policy["zone_caps"]["bottom"]["width"] = 0.78
+        policy["zone_caps"]["top"]["height"] = 0.19
+        policy["zone_caps"]["bottom"]["height"] = 0.19
+
+    if density == "compact":
+        for z in policy["zone_caps"].values():
+            z["width"] = max(0.58, z["width"] - 0.04)
+        policy["cover_pad_x_ratio"] = 0.07
+    elif density == "airy":
+        for z in policy["zone_caps"].values():
+            z["width"] = min(0.82, z["width"] + 0.03)
+        policy["cover_pad_x_ratio"] = 0.10
+
+    if container_preference == "box":
+        # Box styles can be a bit wider; still capped.
+        for z in policy["zone_caps"].values():
+            z["width"] = min(0.84, z["width"] + 0.03)
+    elif container_preference == "none":
+        # Minimal container use: keep tight.
+        for z in policy["zone_caps"].values():
+            z["height"] = max(0.16, z["height"] - 0.03)
+
+    return policy
+
+
+def _apply_caption_style_policy(
+    style: Dict[str, Any],
+    style_intent: Dict[str, Any],
+    pipeline_type: str,
+    target_language: str,
+    video_profile: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """
+    Convert style intent + loose style into a safe render policy.
+    This is the hard-guardrail layer.
+    """
+    out = dict(style or {})
+    account_profile = (video_profile or {}).get("account_style_profile", {}) or {}
+
+    out["font_size_pct"] = max(0.032, min(_safe_float(out.get("font_size_pct"), 0.04), 0.055))
+    out["outline_width"] = max(0, min(_safe_int(out.get("outline_width"), 2), 6))
+    out["shadow_depth"] = max(0, min(_safe_int(out.get("shadow_depth"), 2), 4))
+    out["max_chars_line"] = max(12, min(_safe_int(out.get("max_chars_line"), 25), 36))
+    out["spacing"] = max(0, min(_safe_int(out.get("spacing"), 1), 3))
+
+    density = style_intent.get("density", "balanced")
+    emphasis = style_intent.get("emphasis", "medium")
+    container_pref = style_intent.get("container_preference", "pill")
+
+    if pipeline_type == "subtitle_snap":
+        out["bg_style"] = "pill"
+        out["border_style"] = 3
+        out["container_preference"] = container_pref
+
+        if density == "compact":
+            chars = 20
+            bg_alpha_target = 0.12
+        elif density == "airy":
+            chars = 28
+            bg_alpha_target = 0.19
+        else:
+            chars = 24
+            bg_alpha_target = 0.16
+
+        if emphasis == "high":
+            bg_alpha_target = max(0.08, bg_alpha_target - 0.03)
+        elif emphasis == "low":
+            bg_alpha_target = min(0.24, bg_alpha_target + 0.03)
+
+        # account profile hint is CSS alpha (0 transparent, 1 opaque) -> convert to ASS convention.
+        hint_css = _safe_float(account_profile.get("bg_alpha_hint_css"), -1.0)
+        if 0.0 <= hint_css <= 1.0:
+            hint_ass = 1.0 - hint_css
+            bg_alpha_target = (bg_alpha_target * 0.7) + (hint_ass * 0.3)
+
+        out["max_chars_line"] = max(16, min(chars, out["max_chars_line"]))
+        out["bg_alpha"] = max(0.08, min(bg_alpha_target, 0.24))
+
+        if _is_light_hex_color(out.get("bg_color", "#000000")):
+            out["bg_color"] = "#1A1A1A"
+
+    elif pipeline_type == "blur_plate":
+        # Blur is already applied in pixels; keep overlay readable but compact.
+        out["bg_style"] = "pill"
+        out["border_style"] = 3
+        out["max_chars_line"] = max(16, min(out["max_chars_line"], 28))
+        out["bg_alpha"] = max(0.10, min(_safe_float(out.get("bg_alpha"), 0.16), 0.26))
+        if _is_light_hex_color(out.get("bg_color", "#000000")):
+            out["bg_color"] = "#1A1A1A"
+
+    # Language/script-specific policy clamps
+    lang_base = normalize_language_code(target_language) if target_language else ""
+    if lang_base in ("zh", "ja", "ko") or target_language in ("zh-CN", "zh-TW"):
+        out["max_chars_line"] = min(out["max_chars_line"], 16)
+        out["spacing"] = max(out["spacing"], 1)
+    elif lang_base in ("ar", "he", "fa", "ur"):
+        out["max_chars_line"] = min(out["max_chars_line"], 30)
+
+    out["_style_intent"] = {
+        "container_preference": container_pref,
+        "density": density,
+        "emphasis": emphasis,
+        "motion": style_intent.get("motion", "none"),
+        "source": style_intent.get("source", "default"),
+    }
+    out["_layout_policy"] = _build_layout_policy(
+        pipeline_type=pipeline_type,
+        density=density,
+        container_preference=container_pref,
+    )
+    return out
+
+
+def _solve_container_dimensions(
+    orig_w: int,
+    orig_h: int,
+    text_container_w: int,
+    text_container_h: int,
+    font_size: int,
+    zone: str,
+    video_width: int,
+    video_height: int,
+    layout_policy: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, int]:
+    """Compute robust container dimensions with policy guardrails."""
+    lp = layout_policy or _build_layout_policy("subtitle_snap")
+    caps = (lp.get("zone_caps", {}) or {}).get(zone, {"width": 0.64, "height": 0.24})
+    width_cap_ratio = _safe_float(caps.get("width"), 0.64)
+    height_cap_ratio = _safe_float(caps.get("height"), 0.24)
+
+    cover_pad_x_ratio = _safe_float(lp.get("cover_pad_x_ratio"), 0.08)
+    cover_pad_y_ratio = _safe_float(lp.get("cover_pad_y_ratio"), 0.12)
+    cover_pad_x_min = _safe_int(lp.get("cover_pad_x_min"), 8)
+    cover_pad_y_min = _safe_int(lp.get("cover_pad_y_min"), 8)
+    text_bias_w_ratio = _safe_float(lp.get("text_bias_w_ratio"), 1.6)
+    text_bias_h_ratio = _safe_float(lp.get("text_bias_h_ratio"), 1.2)
+
+    cover_pad_x = int(max(orig_w * cover_pad_x_ratio, cover_pad_x_min))
+    cover_pad_y = int(max(orig_h * cover_pad_y_ratio, cover_pad_y_min))
+    cover_w = orig_w + cover_pad_x * 2
+    cover_h = orig_h + cover_pad_y * 2
+
+    # Detect suspiciously wide source bboxes (likely defaults, not real text)
+    if orig_w > int(video_width * 0.85):
+        cover_w = min(cover_w, max(text_container_w + int(font_size * 2), int(video_width * 0.45)))
+
+    # Over-wide/over-tall source bboxes are often detector artifacts.
+    if orig_w > int(video_width * 0.62) and text_container_w < int(video_width * 0.55):
+        cover_w = max(text_container_w + int(font_size * text_bias_w_ratio), int(video_width * 0.42))
+    if orig_h > int(video_height * 0.20) and text_container_h < int(video_height * 0.14):
+        cover_h = max(text_container_h + int(font_size * text_bias_h_ratio), int(video_height * 0.10))
+
+    container_w = max(text_container_w, cover_w)
+    container_h = max(text_container_h, cover_h)
+    container_w = min(container_w, int(video_width * width_cap_ratio))
+    container_h = min(container_h, int(video_height * height_cap_ratio))
+    container_w = max(container_w, text_container_w)
+    container_h = max(container_h, text_container_h)
+    return container_w, container_h
+
+
+def _enforce_container_guardrails(
+    container_w: int,
+    container_h: int,
+    *,
+    orig_w: int,
+    orig_h: int,
+    text_container_w: int,
+    text_container_h: int,
+    font_size: int,
+    zone: str,
+    video_width: int,
+    video_height: int,
+    layout_policy: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, int, Dict[str, Any]]:
+    """
+    Enforce deterministic sizing guardrails and auto-fallback to compact mode.
+
+    The solver above computes the first-pass size. This layer handles two failure
+    modes seen in production:
+    1) low source coverage (source text can leak through);
+    2) oversized slabs caused by noisy region bboxes.
+    """
+    lp = layout_policy or _build_layout_policy("subtitle_snap")
+    caps = (lp.get("zone_caps", {}) or {}).get(zone, {"width": 0.64, "height": 0.24})
+    width_cap_ratio = _safe_float(caps.get("width"), 0.64)
+    height_cap_ratio = _safe_float(caps.get("height"), 0.24)
+
+    zone = (zone or "middle").lower()
+    zone_area_caps = {"top": 0.14, "middle": 0.16, "bottom": 0.14}
+    max_area_ratio = zone_area_caps.get(zone, 0.16)
+
+    # Treat very wide/tall source boxes as suspect when text itself is compact.
+    effective_orig_w = max(1, orig_w)
+    effective_orig_h = max(1, orig_h)
+    suspect_source_bbox = False
+    if orig_w > int(video_width * 0.58) and text_container_w < int(video_width * 0.50):
+        effective_orig_w = max(text_container_w + int(font_size * 1.6), int(video_width * 0.34))
+        suspect_source_bbox = True
+    if orig_h > int(video_height * 0.22) and text_container_h < int(video_height * 0.16):
+        effective_orig_h = max(text_container_h + int(font_size * 1.2), int(video_height * 0.08))
+        suspect_source_bbox = True
+
+    # Coverage floor.
+    min_cover_w = max(text_container_w, int(effective_orig_w * 1.03))
+    min_cover_h = max(text_container_h, int(effective_orig_h * 1.03))
+    container_w = max(container_w, min_cover_w)
+    container_h = max(container_h, min_cover_h)
+
+    fallback_applied = False
+    fallback_reasons: List[str] = []
+
+    area_ratio = (container_w * container_h) / max(1, video_width * video_height)
+    oversized_before = area_ratio > max_area_ratio
+    if oversized_before:
+        # Compact fallback bound by zone caps and text envelope.
+        max_w = int(video_width * min(0.80, max(0.52, width_cap_ratio - 0.02)))
+        max_h = int(video_height * min(0.24, max(0.14, height_cap_ratio - 0.01)))
+        if zone in ("top", "bottom"):
+            max_h = min(max_h, int(video_height * 0.20))
+
+        # Prevent giant slabs: never exceed a multiple of text envelope.
+        max_w = min(max_w, max(text_container_w, int(text_container_w * 2.20)))
+        max_h = min(max_h, max(text_container_h, int(text_container_h * 2.40)))
+
+        # If source bbox looks noisy, bias harder toward compact text envelope.
+        if suspect_source_bbox:
+            max_w = min(max_w, max(text_container_w, int(text_container_w * 1.70)))
+            max_h = min(max_h, max(text_container_h, int(text_container_h * 1.85)))
+            fallback_reasons.append("suspect_source_bbox")
+
+        new_w = min(container_w, max_w)
+        new_h = min(container_h, max_h)
+
+        # Keep minimum source coverage against effective bbox.
+        new_w = max(new_w, text_container_w, int(effective_orig_w * 1.01))
+        new_h = max(new_h, text_container_h, int(effective_orig_h * 1.01))
+
+        # Respect hard zone caps unless they're smaller than text itself.
+        hard_w_cap = int(video_width * width_cap_ratio)
+        hard_h_cap = int(video_height * height_cap_ratio)
+        if new_w > hard_w_cap and text_container_w <= hard_w_cap:
+            new_w = hard_w_cap
+        if new_h > hard_h_cap and text_container_h <= hard_h_cap:
+            new_h = hard_h_cap
+
+        if new_w < container_w or new_h < container_h:
+            container_w = max(text_container_w, new_w)
+            container_h = max(text_container_h, new_h)
+            fallback_applied = True
+            fallback_reasons.append("compact_fallback")
+
+    # Recheck coverage after fallback and lift if needed.
+    coverage_x_eff = container_w / max(1, effective_orig_w)
+    coverage_y_eff = container_h / max(1, effective_orig_h)
+    if coverage_x_eff < 1.02 or coverage_y_eff < 1.02:
+        target_w = max(container_w, int(effective_orig_w * 1.03))
+        target_h = max(container_h, int(effective_orig_h * 1.03))
+        hard_w_cap = int(video_width * width_cap_ratio)
+        hard_h_cap = int(video_height * height_cap_ratio)
+        if text_container_w <= hard_w_cap:
+            target_w = min(target_w, hard_w_cap)
+        if text_container_h <= hard_h_cap:
+            target_h = min(target_h, hard_h_cap)
+        if target_w > container_w or target_h > container_h:
+            container_w = max(text_container_w, target_w)
+            container_h = max(text_container_h, target_h)
+            fallback_applied = True
+            fallback_reasons.append("coverage_boost")
+
+    coverage_x_eff = container_w / max(1, effective_orig_w)
+    coverage_y_eff = container_h / max(1, effective_orig_h)
+    coverage_x_raw = container_w / max(1, orig_w)
+    coverage_y_raw = container_h / max(1, orig_h)
+    area_ratio = (container_w * container_h) / max(1, video_width * video_height)
+
+    metrics = {
+        "coverage_x_eff": coverage_x_eff,
+        "coverage_y_eff": coverage_y_eff,
+        "coverage_x_raw": coverage_x_raw,
+        "coverage_y_raw": coverage_y_raw,
+        "area_ratio": area_ratio,
+        "max_area_ratio": max_area_ratio,
+        "coverage_low": coverage_x_eff < 1.02 or coverage_y_eff < 1.02,
+        "oversized": area_ratio > max_area_ratio,
+        "oversized_before": oversized_before,
+        "fallback_applied": fallback_applied,
+        "fallback_reasons": fallback_reasons,
+        "suspect_source_bbox": suspect_source_bbox,
+        "effective_orig_w": effective_orig_w,
+        "effective_orig_h": effective_orig_h,
+    }
+    return container_w, container_h, metrics
+
+
 # =============================================================================
 # Caption Style System — Market-Aware Presets
 # =============================================================================
@@ -2230,7 +2959,7 @@ def _hex_to_ass_color(hex_color: str, alpha: float = 0.0) -> str:
 # - Shadow for depth on bright backgrounds
 # - Chunked text (3-7 words per line, not full sentences)
 #
-# Style Format keys:
+# Style Format keys (core — used by ASS renderer):
 #   font: font family name
 #   font_size_pct: % of video height (e.g., 0.042 = 4.2%)
 #   bold: bool
@@ -2245,9 +2974,22 @@ def _hex_to_ass_color(hex_color: str, alpha: float = 0.0) -> str:
 #   border_style: 1 (outline+shadow) or 3 (opaque box)
 #   spacing: int (letter spacing, 0-3)
 #   max_chars_line: int (word wrap threshold)
+#
+# Extended metadata keys (geo-native styling):
+#   font_family: canonical font family name (e.g., "Montserrat")
+#   font_weight: weight string ("Bold"/"ExtraBold"/"Black"/"Regular")
+#   border_radius: px (0=square, 999=full pill)
+#   padding_x_ratio: float (horizontal padding relative to font_size)
+#   padding_y_ratio: float (vertical padding relative to font_size)
+#   text_transform: "uppercase" | "none"
+#   animation: "fade" | "pop" | "none"
 
 CAPTION_STYLE_PRESETS = {
-    # ── TikTok Native ──────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # PLATFORM PRESETS (content-type based)
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── TikTok Native — bold outline, no bg ──────────────────────────
     "tiktok_bold": {
         "font": "Montserrat",
         "font_size_pct": 0.042,
@@ -2263,8 +3005,17 @@ CAPTION_STYLE_PRESETS = {
         "border_style": 1,
         "spacing": 1,
         "max_chars_line": 25,
+        "font_family": "Montserrat",
+        "font_weight": "Bold",
+        "border_radius": 0,
+        "padding_x_ratio": 0.0,
+        "padding_y_ratio": 0.0,
+        "text_transform": "none",
+        "animation": "none",
     },
-    # ── TikTok with dark pill bg (CapCut-style) ───────────────────
+    # ── EN (US/UK) — TikTok pill, CapCut-style ──────────────────────
+    # Montserrat Bold, white on dark semi-transparent pill (rgba 0,0,0,0.85),
+    # full pill border-radius, text-shadow for depth
     "tiktok_pill": {
         "font": "Montserrat",
         "font_size_pct": 0.038,
@@ -2272,16 +3023,23 @@ CAPTION_STYLE_PRESETS = {
         "text_color": "#FFFFFF",
         "outline_color": "#1A1A1A",
         "outline_width": 0,
-        "shadow_depth": 0,
+        "shadow_depth": 2,
         "shadow_color": "#000000",
         "bg_style": "pill",
-        "bg_color": "#1A1A1A",
-        "bg_alpha": 0.15,
+        "bg_color": "#000000",
+        "bg_alpha": 0.15,   # ASS: 0=opaque → 0.15 = 85% opaque (rgba 0,0,0,0.85)
         "border_style": 3,
         "spacing": 1,
         "max_chars_line": 28,
+        "font_family": "Montserrat",
+        "font_weight": "Bold",
+        "border_radius": 999,     # full pill
+        "padding_x_ratio": 0.6,
+        "padding_y_ratio": 0.25,
+        "text_transform": "none",
+        "animation": "fade",
     },
-    # ── Reels / YouTube Shorts — clean modern ─────────────────────
+    # ── Reels / YouTube Shorts — clean modern ────────────────────────
     "reels_clean": {
         "font": "Helvetica",
         "font_size_pct": 0.040,
@@ -2297,8 +3055,15 @@ CAPTION_STYLE_PRESETS = {
         "border_style": 1,
         "spacing": 0,
         "max_chars_line": 28,
+        "font_family": "Helvetica",
+        "font_weight": "Bold",
+        "border_radius": 0,
+        "padding_x_ratio": 0.0,
+        "padding_y_ratio": 0.0,
+        "text_transform": "none",
+        "animation": "none",
     },
-    # ── Blogger / Talking Head — accent color box ─────────────────
+    # ── Blogger / Talking Head — accent color box ────────────────────
     "blogger_accent": {
         "font": "Montserrat",
         "font_size_pct": 0.045,
@@ -2314,8 +3079,15 @@ CAPTION_STYLE_PRESETS = {
         "border_style": 3,
         "spacing": 1,
         "max_chars_line": 22,
+        "font_family": "Montserrat",
+        "font_weight": "Bold",
+        "border_radius": 6,
+        "padding_x_ratio": 0.5,
+        "padding_y_ratio": 0.2,
+        "text_transform": "none",
+        "animation": "pop",
     },
-    # ── Product / Tutorial — minimal clean ────────────────────────
+    # ── Product / Tutorial — minimal clean ───────────────────────────
     "product_minimal": {
         "font": "Helvetica",
         "font_size_pct": 0.035,
@@ -2331,8 +3103,15 @@ CAPTION_STYLE_PRESETS = {
         "border_style": 1,
         "spacing": 0,
         "max_chars_line": 30,
+        "font_family": "Helvetica",
+        "font_weight": "Bold",
+        "border_radius": 0,
+        "padding_x_ratio": 0.0,
+        "padding_y_ratio": 0.0,
+        "text_transform": "none",
+        "animation": "none",
     },
-    # ── Dark strip — TikTok dubbed content ────────────────────────
+    # ── Dark strip — TikTok dubbed content ───────────────────────────
     "dubbed_strip": {
         "font": "Montserrat",
         "font_size_pct": 0.038,
@@ -2343,21 +3122,35 @@ CAPTION_STYLE_PRESETS = {
         "shadow_depth": 0,
         "shadow_color": "#000000",
         "bg_style": "strip",
-        "bg_color": "#0A0A0A",
-        "bg_alpha": 0.08,  # ASS convention: 0=opaque. 0.08 = 92% opaque (covers source text)
+        "bg_color": "#1A1A1A",
+        "bg_alpha": 0.18,   # ASS convention: 0=opaque. 0.18 = 82% opaque (semi-transparent)
         "border_style": 1,
         "spacing": 1,
         "max_chars_line": 32,
+        "font_family": "Montserrat",
+        "font_weight": "Bold",
+        "border_radius": 0,
+        "padding_x_ratio": 0.3,
+        "padding_y_ratio": 0.15,
+        "text_transform": "none",
+        "animation": "fade",
     },
-    # ── LATAM market — warm, vibrant ──────────────────────────────
+
+    # ══════════════════════════════════════════════════════════════════
+    # GEO-NATIVE PRESETS (market/language based)
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── ES (LATAM) — vibrant, no bg, heavy stroke + hard shadow ──────
+    # Poppins ExtraBold, white, 3px black stroke, uppercase.
+    # Matches LATAM TikTok/Reels trend: loud, colorful, high contrast.
     "latam_vibrant": {
-        "font": "Montserrat",
+        "font": "Poppins",
         "font_size_pct": 0.044,
         "bold": True,
         "text_color": "#FFFFFF",
         "outline_color": "#000000",
-        "outline_width": 4,
-        "shadow_depth": 2,
+        "outline_width": 3,
+        "shadow_depth": 3,
         "shadow_color": "#1A1A1A",
         "bg_style": "none",
         "bg_color": "#000000",
@@ -2365,25 +3158,200 @@ CAPTION_STYLE_PRESETS = {
         "border_style": 1,
         "spacing": 1,
         "max_chars_line": 24,
+        "font_family": "Poppins",
+        "font_weight": "ExtraBold",
+        "border_radius": 0,
+        "padding_x_ratio": 0.0,
+        "padding_y_ratio": 0.0,
+        "text_transform": "uppercase",
+        "animation": "pop",
     },
-    # ── Arabic / RTL — Noto Arabic with RTL-friendly sizing ───────
-    "arabic_native": {
-        "font": "Noto Sans Arabic",
-        "font_size_pct": 0.040,
+    # ── PT-BR — Brazil energy, similar to LATAM with color accent ────
+    # Poppins ExtraBold, white text, heavy black stroke, dark green
+    # shadow accent (Brazil flag energy), uppercase.
+    "brazil_energy": {
+        "font": "Poppins",
+        "font_size_pct": 0.044,
         "bold": True,
         "text_color": "#FFFFFF",
         "outline_color": "#000000",
         "outline_width": 3,
-        "shadow_depth": 2,
-        "shadow_color": "#111111",
+        "shadow_depth": 3,
+        "shadow_color": "#1B5E20",   # dark green accent (Brazil)
         "bg_style": "none",
         "bg_color": "#000000",
         "bg_alpha": 0.0,
         "border_style": 1,
+        "spacing": 1,
+        "max_chars_line": 24,
+        "font_family": "Poppins",
+        "font_weight": "ExtraBold",
+        "border_radius": 0,
+        "padding_x_ratio": 0.0,
+        "padding_y_ratio": 0.0,
+        "text_transform": "uppercase",
+        "animation": "pop",
+    },
+    # ── AR (MENA) — clean dark box, RTL-optimized ────────────────────
+    # Cairo Bold (or Noto Sans Arabic fallback), white text on dark
+    # opaque box (0.85 alpha), 8px radius, no outline. RTL-friendly.
+    "arabic_clean": {
+        "font": "Cairo",
+        "font_size_pct": 0.040,
+        "bold": True,
+        "text_color": "#FFFFFF",
+        "outline_color": "#000000",
+        "outline_width": 0,
+        "shadow_depth": 1,
+        "shadow_color": "#000000",
+        "bg_style": "box",
+        "bg_color": "#000000",
+        "bg_alpha": 0.15,   # 85% opaque dark box
+        "border_style": 3,
         "spacing": 0,
         "max_chars_line": 30,
+        "font_family": "Cairo",
+        "font_weight": "Bold",
+        "border_radius": 8,
+        "padding_x_ratio": 0.5,
+        "padding_y_ratio": 0.25,
+        "text_transform": "none",
+        "animation": "fade",
     },
-    # ── CJK (Chinese/Japanese/Korean) — wider spacing ─────────────
+    # ── DE — European clean, corporate, high legibility ──────────────
+    # Inter 500-700 weight, dark bg with 0.9 alpha, 4px radius,
+    # subtle shadow. German audiences prefer understated clarity.
+    "european_clean": {
+        "font": "Inter",
+        "font_size_pct": 0.038,
+        "bold": True,
+        "text_color": "#FFFFFF",
+        "outline_color": "#1A1A1A",
+        "outline_width": 0,
+        "shadow_depth": 1,
+        "shadow_color": "#111111",
+        "bg_style": "box",
+        "bg_color": "#0A0A0A",
+        "bg_alpha": 0.10,   # 90% opaque dark bg
+        "border_style": 3,
+        "spacing": 0,
+        "max_chars_line": 30,
+        "font_family": "Inter",
+        "font_weight": "Bold",
+        "border_radius": 4,
+        "padding_x_ratio": 0.5,
+        "padding_y_ratio": 0.2,
+        "text_transform": "none",
+        "animation": "fade",
+    },
+    # ── FR — French elegant, refined European clean ──────────────────
+    # Same base as DE but slightly larger text, more padding, slightly
+    # more shadow for cinematic depth. French content leans refined.
+    "french_elegant": {
+        "font": "Inter",
+        "font_size_pct": 0.039,
+        "bold": True,
+        "text_color": "#FFFFFF",
+        "outline_color": "#1A1A1A",
+        "outline_width": 0,
+        "shadow_depth": 2,
+        "shadow_color": "#0D0D0D",
+        "bg_style": "box",
+        "bg_color": "#0A0A0A",
+        "bg_alpha": 0.10,   # 90% opaque dark bg
+        "border_style": 3,
+        "spacing": 0,
+        "max_chars_line": 32,
+        "font_family": "Inter",
+        "font_weight": "Bold",
+        "border_radius": 4,
+        "padding_x_ratio": 0.55,
+        "padding_y_ratio": 0.22,
+        "text_transform": "none",
+        "animation": "fade",
+    },
+    # ── JA — Japanese telop, anime/variety show style ────────────────
+    # Noto Sans CJK JP Black, white text, NO background, heavy 4px
+    # colored outline (#FF6699 pink), glow effect. Matches telop tradition.
+    "jp_telop": {
+        "font": "Noto Sans CJK JP",
+        "font_size_pct": 0.042,
+        "bold": True,
+        "text_color": "#FFFFFF",
+        "outline_color": "#FF6699",
+        "outline_width": 4,
+        "shadow_depth": 3,
+        "shadow_color": "#CC3366",   # darker pink glow
+        "bg_style": "none",
+        "bg_color": "#000000",
+        "bg_alpha": 0.0,
+        "border_style": 1,
+        "spacing": 2,
+        "max_chars_line": 14,
+        "font_family": "Noto Sans JP",
+        "font_weight": "Black",
+        "border_radius": 0,
+        "padding_x_ratio": 0.0,
+        "padding_y_ratio": 0.0,
+        "text_transform": "none",
+        "animation": "pop",
+    },
+    # ── KO — Korean cafe aesthetic, light & soft ─────────────────────
+    # Noto Sans CJK KR light (300-400 weight), dark text on white/pastel
+    # bg (85% opaque). Clean, airy feel matching Korean design trends.
+    "korean_cafe": {
+        "font": "Noto Sans CJK KR",
+        "font_size_pct": 0.040,
+        "bold": False,
+        "text_color": "#1A1A1A",
+        "outline_color": "#FFFFFF",
+        "outline_width": 0,
+        "shadow_depth": 1,
+        "shadow_color": "#CCCCCC",
+        "bg_style": "box",
+        "bg_color": "#FFFFFF",
+        "bg_alpha": 0.15,   # 85% opaque white/pastel bg
+        "border_style": 3,
+        "spacing": 1,
+        "max_chars_line": 16,
+        "font_family": "Noto Sans KR",
+        "font_weight": "Regular",
+        "border_radius": 8,
+        "padding_x_ratio": 0.5,
+        "padding_y_ratio": 0.25,
+        "text_transform": "none",
+        "animation": "fade",
+    },
+
+    # ══════════════════════════════════════════════════════════════════
+    # LEGACY / COMPAT ALIASES
+    # ══════════════════════════════════════════════════════════════════
+
+    # arabic_native — alias for arabic_clean (backwards compat)
+    "arabic_native": {
+        "font": "Cairo",
+        "font_size_pct": 0.040,
+        "bold": True,
+        "text_color": "#FFFFFF",
+        "outline_color": "#000000",
+        "outline_width": 0,
+        "shadow_depth": 1,
+        "shadow_color": "#000000",
+        "bg_style": "box",
+        "bg_color": "#000000",
+        "bg_alpha": 0.15,
+        "border_style": 3,
+        "spacing": 0,
+        "max_chars_line": 30,
+        "font_family": "Cairo",
+        "font_weight": "Bold",
+        "border_radius": 8,
+        "padding_x_ratio": 0.5,
+        "padding_y_ratio": 0.25,
+        "text_transform": "none",
+        "animation": "fade",
+    },
+    # cjk_bold — Chinese generic (wider spacing)
     "cjk_bold": {
         "font": "Noto Sans CJK SC",
         "font_size_pct": 0.042,
@@ -2399,7 +3367,76 @@ CAPTION_STYLE_PRESETS = {
         "border_style": 1,
         "spacing": 2,
         "max_chars_line": 16,
+        "font_family": "Noto Sans CJK SC",
+        "font_weight": "Bold",
+        "border_radius": 0,
+        "padding_x_ratio": 0.0,
+        "padding_y_ratio": 0.0,
+        "text_transform": "none",
+        "animation": "none",
     },
+    # en_production — alias for tiktok_pill with higher opacity
+    "en_production": {
+        "font": "Montserrat",
+        "font_size_pct": 0.040,
+        "bold": True,
+        "text_color": "#FFFFFF",
+        "outline_color": "#1A1A1A",
+        "outline_width": 0,
+        "shadow_depth": 2,
+        "shadow_color": "#000000",
+        "bg_style": "pill",
+        "bg_color": "#000000",
+        "bg_alpha": 0.08,   # 92% opaque for overlay coverage
+        "border_style": 3,
+        "spacing": 1,
+        "max_chars_line": 28,
+        "font_family": "Montserrat",
+        "font_weight": "Bold",
+        "border_radius": 999,
+        "padding_x_ratio": 0.6,
+        "padding_y_ratio": 0.25,
+        "text_transform": "none",
+        "animation": "fade",
+    },
+    # arabic_production — alias for arabic_clean with higher opacity
+    "arabic_production": {
+        "font": "Cairo",
+        "font_size_pct": 0.040,
+        "bold": True,
+        "text_color": "#FFFFFF",
+        "outline_color": "#0A0A0A",
+        "outline_width": 0,
+        "shadow_depth": 1,
+        "shadow_color": "#000000",
+        "bg_style": "pill",
+        "bg_color": "#0A0A0A",
+        "bg_alpha": 0.08,   # 92% opaque for overlay coverage
+        "border_style": 3,
+        "spacing": 0,
+        "max_chars_line": 28,
+        "font_family": "Cairo",
+        "font_weight": "Bold",
+        "border_radius": 8,
+        "padding_x_ratio": 0.5,
+        "padding_y_ratio": 0.25,
+        "text_transform": "none",
+        "animation": "fade",
+    },
+}
+
+# ── GEO_STYLE_MAP — canonical lang code → preset name ────────────────
+# Primary mapping for geo-native caption styles.
+# Default fallback: "tiktok_pill"
+GEO_STYLE_MAP = {
+    "en": "tiktok_pill",
+    "es": "latam_vibrant",
+    "pt": "brazil_energy",
+    "ar": "arabic_clean",
+    "de": "european_clean",
+    "fr": "french_elegant",
+    "ja": "jp_telop",
+    "ko": "korean_cafe",
 }
 
 # Map video content types to best caption presets
@@ -2416,18 +3453,43 @@ _CONTENT_TYPE_STYLE_MAP = {
 }
 
 # Market-specific overrides (target language → preferred style)
+# Production: each geo gets its own native-looking style.
+# Uses GEO_STYLE_MAP presets + variant codes for regional specificity.
 _MARKET_STYLE_MAP = {
-    "ar": "arabic_native",
-    "he": "arabic_native",
-    "fa": "arabic_native",
-    "ur": "arabic_native",
+    # English markets — TikTok pill
+    "en": "tiktok_pill",
+    "en-US": "tiktok_pill",
+    "en-GB": "tiktok_pill",
+    # Arabic/RTL — clean dark box
+    "ar": "arabic_clean",
+    "he": "arabic_clean",
+    "fa": "arabic_clean",
+    "ur": "arabic_clean",
+    # CJK — language-specific styles
     "zh-CN": "cjk_bold",
     "zh-TW": "cjk_bold",
-    "ja": "cjk_bold",
-    "ko": "cjk_bold",
-    "pt-BR": "latam_vibrant",
-    "es-MX": "latam_vibrant",
+    "ja": "jp_telop",
+    "ko": "korean_cafe",
+    # LATAM — vibrant, heavy stroke
     "es": "latam_vibrant",
+    "es-MX": "latam_vibrant",
+    "es-AR": "latam_vibrant",
+    # Brazil — separate energy style
+    "pt": "brazil_energy",
+    "pt-BR": "brazil_energy",
+    # European — geo-specific styles
+    "de": "european_clean",
+    "fr": "french_elegant",
+    "it": "european_clean",
+    "nl": "european_clean",
+    "pl": "european_clean",
+    "sv": "european_clean",
+    # Turkish — bold sans, no background
+    "tr": "tiktok_bold",
+    # Hindi/Indic — default to tiktok_pill (covers well)
+    "hi": "tiktok_pill",
+    "bn": "tiktok_pill",
+    "ta": "tiktok_pill",
 }
 
 
@@ -2450,11 +3512,23 @@ def _resolve_caption_style(
 
     Returns a merged style dict ready for ASS generation.
     """
-    # ── Priority 1: Use Gemini-generated style if available ──
+    style_intent = _extract_style_intent(
+        target_caption_style=target_caption_style,
+        subtitle_style=subtitle_style,
+        video_profile=video_profile,
+        pipeline_type=pipeline_type,
+    )
+
+    style = None
+    preset_name = "tiktok_bold"
+    style_source = "preset"
+    style_reasoning = ""
+
+    # ── Priority 1: Use Gemini-generated style as intent source if available ──
     if target_caption_style and isinstance(target_caption_style, dict):
         required_keys = {"font", "text_color", "outline_color"}
         if required_keys.issubset(target_caption_style.keys()):
-            # Start from Gemini's recommendation
+            css_alpha = max(0.0, min(_safe_float(target_caption_style.get("bg_alpha"), 1.0), 1.0))
             style = {
                 "font": target_caption_style.get("font", "Montserrat"),
                 "font_size_pct": target_caption_style.get("font_size_pct", 0.042),
@@ -2466,82 +3540,90 @@ def _resolve_caption_style(
                 "shadow_color": target_caption_style.get("shadow_color", "#000000"),
                 "bg_style": target_caption_style.get("bg_style", "none"),
                 "bg_color": target_caption_style.get("bg_color", "#000000"),
-                # Gemini uses CSS convention (0=transparent, 1=opaque)
-                # Internal/ASS convention is inverted (0=opaque, 1=transparent)
-                "bg_alpha": 1.0 - float(target_caption_style.get("bg_alpha", 1.0)),
+                # Gemini uses CSS alpha (0 transparent, 1 opaque).
+                # Internal ASS convention is inverted (0 opaque, 1 transparent).
+                "bg_alpha": 1.0 - css_alpha,
                 "border_style": target_caption_style.get("border_style", 1),
                 "spacing": target_caption_style.get("spacing", 1),
                 "max_chars_line": target_caption_style.get("max_chars_line", 25),
             }
+            style_source = "gemini_generated"
+            style_reasoning = target_caption_style.get("style_reasoning", "")
 
-            # ── Priority 2: Apply market-specific corrections on top of Gemini style ──
-            # CJK needs different font + smaller max_chars
-            lang_base = normalize_language_code(target_language) if target_language else ""
-            if lang_base in ("zh", "ja", "ko") or target_language in ("zh-CN", "zh-TW"):
-                cjk_fonts = {"ja": "Noto Sans CJK JP", "ko": "Noto Sans CJK KR", "zh": "Noto Sans CJK SC"}
-                style["font"] = cjk_fonts.get(lang_base, "Noto Sans CJK SC")
-                if target_language == "zh-TW":
-                    style["font"] = "Noto Sans CJK TC"
-                style["max_chars_line"] = min(style["max_chars_line"], 16)
-                style["spacing"] = max(style["spacing"], 2)
-            elif lang_base in ("ar", "he", "fa", "ur"):
-                style["font"] = "Noto Sans Arabic" if lang_base in ("ar", "fa", "ur") else "Noto Sans Hebrew"
-                style["max_chars_line"] = min(style["max_chars_line"], 30)
-            elif lang_base in ("hi", "bn", "ta", "te"):
-                indic_fonts = {"hi": "Noto Sans Devanagari", "bn": "Noto Sans Bengali", "ta": "Noto Sans Tamil", "te": "Noto Sans Telugu"}
-                style["font"] = indic_fonts.get(lang_base, "Noto Sans Devanagari")
+    # ── Fallback: preset-based style ──
+    if style is None:
+        if pipeline_type == "subtitle_snap":
+            preset_name = "tiktok_pill"
+        elif pipeline_type == "blur_plate":
+            preset_name = "tiktok_pill"
 
-            style["_preset_name"] = "gemini_generated"
-            style["_style_reasoning"] = target_caption_style.get("style_reasoning", "")
-            logger.info(f"CAPTION_STYLE: Using Gemini-generated style "
-                        f"(font={style['font']}, bg={style['bg_style']}, "
-                        f"reason={style.get('_style_reasoning', '')[:60]})")
-            return style
+        if video_profile:
+            video_type = video_profile.get("video_type", "")
+            if video_type in _CONTENT_TYPE_STYLE_MAP:
+                preset_name = _CONTENT_TYPE_STYLE_MAP[video_type]
 
-    # ── Fallback: existing preset-based resolution ──
-    # Start with default
-    preset_name = "tiktok_bold"
+        lang_base = normalize_language_code(target_language) if target_language else ""
+        if target_language in _MARKET_STYLE_MAP:
+            preset_name = _MARKET_STYLE_MAP[target_language]
+        elif lang_base in _MARKET_STYLE_MAP:
+            preset_name = _MARKET_STYLE_MAP[lang_base]
 
-    # 4. Pipeline-specific defaults
-    if pipeline_type == "subtitle_snap":
-        preset_name = "dubbed_strip"
-    elif pipeline_type == "blur_plate":
-        preset_name = "tiktok_pill"
+        style = dict(CAPTION_STYLE_PRESETS.get(preset_name, CAPTION_STYLE_PRESETS["tiktok_bold"]))
 
-    # 3. Content-type override
-    if video_profile:
-        video_type = video_profile.get("video_type", "")
-        if video_type in _CONTENT_TYPE_STYLE_MAP:
-            preset_name = _CONTENT_TYPE_STYLE_MAP[video_type]
+        # Apply original source style hints only for preset fallback path.
+        if subtitle_style:
+            orig_font = subtitle_style.get("font_family", "")
+            good_fonts = {"Impact", "Montserrat", "Helvetica", "Arial", "Bebas Neue", "Oswald", "Raleway"}
+            if orig_font in good_fonts:
+                style["font"] = orig_font
+            if subtitle_style.get("text_color"):
+                style["text_color"] = subtitle_style["text_color"]
+            if subtitle_style.get("outline_color"):
+                style["outline_color"] = subtitle_style["outline_color"]
 
-    # 2. Market override (highest priority for language fit)
+    # Market/script corrections are applied in both gemini + preset paths.
     lang_base = normalize_language_code(target_language) if target_language else ""
-    if target_language in _MARKET_STYLE_MAP:
-        preset_name = _MARKET_STYLE_MAP[target_language]
-    elif lang_base in _MARKET_STYLE_MAP:
-        preset_name = _MARKET_STYLE_MAP[lang_base]
+    if lang_base in ("zh", "ja", "ko") or target_language in ("zh-CN", "zh-TW"):
+        cjk_fonts = {"ja": "Noto Sans CJK JP", "ko": "Noto Sans CJK KR", "zh": "Noto Sans CJK SC"}
+        style["font"] = cjk_fonts.get(lang_base, "Noto Sans CJK SC")
+        if target_language == "zh-TW":
+            style["font"] = "Noto Sans CJK TC"
+        style["max_chars_line"] = min(_safe_int(style.get("max_chars_line"), 20), 16)
+        style["spacing"] = max(_safe_int(style.get("spacing"), 1), 1)
+    elif lang_base in ("ar", "he", "fa", "ur"):
+        style["font"] = "Noto Sans Arabic" if lang_base in ("ar", "fa", "ur") else "Noto Sans Hebrew"
+        style["max_chars_line"] = min(_safe_int(style.get("max_chars_line"), 28), 30)
+    elif lang_base in ("hi", "bn", "ta", "te"):
+        indic_fonts = {"hi": "Noto Sans Devanagari", "bn": "Noto Sans Bengali", "ta": "Noto Sans Tamil", "te": "Noto Sans Telugu"}
+        style["font"] = indic_fonts.get(lang_base, "Noto Sans Devanagari")
+    else:
+        geo_font = get_geo_font(target_language) if target_language else style.get("font", "Montserrat")
+        if geo_font != style.get("font"):
+            logger.info(f"CAPTION_STYLE: Geo font override: '{style.get('font')}' -> '{geo_font}' for lang={target_language}")
+            style["font"] = geo_font
 
-    # Get the preset
-    style = dict(CAPTION_STYLE_PRESETS.get(preset_name, CAPTION_STYLE_PRESETS["tiktok_bold"]))
+    # Final deterministic policy pass.
+    style = _apply_caption_style_policy(
+        style=style,
+        style_intent=style_intent,
+        pipeline_type=pipeline_type,
+        target_language=target_language,
+        video_profile=video_profile,
+    )
+    style["_preset_name"] = "gemini_generated" if style_source == "gemini_generated" else preset_name
+    style["_style_reasoning"] = style_reasoning
 
-    # 1. Apply original video style hints (Gemini manifest overrides)
-    if subtitle_style:
-        # Use original font if it's a known good font
-        orig_font = subtitle_style.get("font_family", "")
-        good_fonts = {"Impact", "Montserrat", "Helvetica", "Arial", "Bebas Neue", "Oswald", "Raleway"}
-        if orig_font in good_fonts:
-            style["font"] = orig_font
-
-        # Use original colors if they have good contrast
-        if subtitle_style.get("text_color"):
-            style["text_color"] = subtitle_style["text_color"]
-        if subtitle_style.get("outline_color"):
-            style["outline_color"] = subtitle_style["outline_color"]
-
-    style["_preset_name"] = preset_name
-    logger.info(f"CAPTION_STYLE: resolved preset='{preset_name}' "
-                f"(lang={target_language}, pipeline={pipeline_type}, "
-                f"font={style['font']}, bg={style['bg_style']})")
+    logger.info(
+        "CAPTION_STYLE: resolved source=%s preset=%s lang=%s pipeline=%s "
+        "font=%s bg=%s intent=%s",
+        style_source,
+        style.get("_preset_name"),
+        target_language,
+        pipeline_type,
+        style.get("font"),
+        style.get("bg_style"),
+        style.get("_style_intent"),
+    )
     return style
 
 
@@ -2571,28 +3653,362 @@ def _build_ass_styles(style: Dict, video_height: int, is_rtl: bool = False, rtl_
     # Main text style
     styles = f"Style: TranslatedText,{font},{font_size},{text_color},{text_color},{outline_color},{bg_color},{bold},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow_d},5,10,10,10,1\n"
 
+    # No-box text style for custom overlay renderers (subtitle_snap / blur_plate).
+    # Avoids nested black boxes when main style uses BorderStyle=3.
+    no_box_outline = max(2, outline_w) if border_style == 3 else outline_w
+    no_box_shadow = max(2, shadow_d)
+    styles += f"Style: TranslatedTextNoBox,{font},{font_size},{text_color},{text_color},{outline_color},&H00000000,{bold},0,0,0,100,100,{spacing},0,1,{no_box_outline},{no_box_shadow},5,10,10,10,1\n"
+
     # BackPlate (drawing-only, 1px invisible font)
     styles += f"Style: BackPlate,Arial,1,&H00000000,&H00000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n"
 
-    # BackPlateBox — for backplate_overlay strategy
-    box_bg = _hex_to_ass_color(style["bg_color"], alpha=max(0.05, style["bg_alpha"] - 0.1))
-    styles += f"Style: BackPlateBox,{font},{font_size},{text_color},&H000000FF,{_hex_to_ass_color('#0A0A0A', 0.1)},{box_bg},{bold},0,0,0,100,100,{spacing},0,3,10,0,5,10,10,10,1\n"
+    # BackPlateBox — for backplate_overlay strategy (BorderStyle=3: opaque box behind text)
+    box_bg = _hex_to_ass_color(style["bg_color"], alpha=max(0.05, style["bg_alpha"]))
+    box_outline = _hex_to_ass_color(style["bg_color"], alpha=max(0.05, style["bg_alpha"]))
+    styles += f"Style: BackPlateBox,{font},{font_size},{text_color},&H000000FF,{box_outline},{box_bg},{bold},0,0,0,100,100,{spacing},0,3,10,2,5,10,10,10,1\n"
 
     # RTL variants
     if is_rtl and rtl_font:
         styles += f"Style: TranslatedTextRTL,{rtl_font},{font_size},{text_color},{text_color},{outline_color},{bg_color},{bold},0,0,0,100,100,{spacing},0,{border_style},{outline_w},{shadow_d},5,10,10,10,1\n"
-        styles += f"Style: BackPlateBoxRTL,{rtl_font},{font_size},{text_color},&H000000FF,{_hex_to_ass_color('#0A0A0A', 0.1)},{box_bg},{bold},0,0,0,100,100,{spacing},0,3,10,0,5,10,10,10,1\n"
+        styles += f"Style: TranslatedTextNoBoxRTL,{rtl_font},{font_size},{text_color},{text_color},{outline_color},&H00000000,{bold},0,0,0,100,100,{spacing},0,1,{no_box_outline},{no_box_shadow},5,10,10,10,1\n"
+        styles += f"Style: BackPlateBoxRTL,{rtl_font},{font_size},{text_color},&H000000FF,{box_outline},{box_bg},{bold},0,0,0,100,100,{spacing},0,3,10,2,5,10,10,10,1\n"
 
     return styles, font_size
 
 
 def _format_ass_time(seconds: float) -> str:
     """Convert seconds to ASS time format (H:MM:SS.CC)."""
+    if seconds < 0:
+        seconds = 0.0
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     centisecs = int((seconds % 1) * 100)
     return f"{hours}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
+
+
+def _position_to_zone(position: str) -> str:
+    """Map position strings to canonical zones: top/middle/bottom."""
+    pos = (position or "").lower()
+    if pos in ("top", "top_left", "top_right", "upper"):
+        return "top"
+    if pos in ("bottom", "bottom_left", "bottom_right", "lower"):
+        return "bottom"
+    return "middle"
+
+
+def _bbox_area_norm(bbox: list) -> float:
+    """Area of normalized bbox."""
+    if not bbox or len(bbox) < 4:
+        return 0.0
+    w = max(0.0, float(bbox[2]) - float(bbox[0]))
+    h = max(0.0, float(bbox[3]) - float(bbox[1]))
+    return w * h
+
+
+def _bbox_center_norm(bbox: list) -> Tuple[float, float]:
+    """Center of normalized bbox."""
+    if not bbox or len(bbox) < 4:
+        return 0.5, 0.5
+    return (float(bbox[0]) + float(bbox[2])) / 2.0, (float(bbox[1]) + float(bbox[3])) / 2.0
+
+
+def _bbox_iou_norm(a: list, b: list) -> float:
+    """IoU for two normalized bboxes."""
+    if not a or not b or len(a) < 4 or len(b) < 4:
+        return 0.0
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(1e-9, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1e-9, (bx2 - bx1) * (by2 - by1))
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _blend_bbox_norm(base_bbox: list, next_bbox: list, next_weight: float) -> list:
+    """Linear blend of two normalized bboxes."""
+    wb = max(0.0, min(1.0, 1.0 - float(next_weight)))
+    wn = max(0.0, min(1.0, float(next_weight)))
+    out = []
+    for i in range(4):
+        out.append((float(base_bbox[i]) * wb) + (float(next_bbox[i]) * wn))
+    # Ensure sorted + clamped bounds
+    x1, y1, x2, y2 = out
+    x1, x2 = sorted((max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))))
+    y1, y2 = sorted((max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))))
+    return [x1, y1, x2, y2]
+
+
+def _clamp_bbox_by_zone(bbox: list, zone: str) -> Tuple[list, bool]:
+    """Clamp bbox dimensions to zone-specific caps to avoid giant slabs."""
+    zone = (zone or "middle").lower()
+    zone_caps = {
+        "top": {"w": 0.78, "h": 0.22},
+        "middle": {"w": 0.72, "h": 0.28},
+        "bottom": {"w": 0.78, "h": 0.22},
+    }
+    caps = zone_caps.get(zone, zone_caps["middle"])
+    max_w = caps["w"]
+    max_h = caps["h"]
+
+    x1, y1, x2, y2 = _normalize_bbox(bbox)
+    cx, cy = _bbox_center_norm([x1, y1, x2, y2])
+    w = max(1e-4, x2 - x1)
+    h = max(1e-4, y2 - y1)
+    changed = False
+
+    if w > max_w:
+        w = max_w
+        changed = True
+    if h > max_h:
+        h = max_h
+        changed = True
+
+    # Keep zone semantics if detector drifts heavily.
+    if zone == "top" and cy > 0.55:
+        cy = 0.28
+        changed = True
+    elif zone == "bottom" and cy < 0.45:
+        cy = 0.72
+        changed = True
+
+    nx1 = max(0.0, cx - w / 2.0)
+    ny1 = max(0.0, cy - h / 2.0)
+    nx2 = min(1.0, cx + w / 2.0)
+    ny2 = min(1.0, cy + h / 2.0)
+
+    # Preserve dimensions after edge clipping.
+    if (nx2 - nx1) < w:
+        if nx1 <= 0.0:
+            nx2 = min(1.0, nx1 + w)
+        elif nx2 >= 1.0:
+            nx1 = max(0.0, nx2 - w)
+        changed = True
+    if (ny2 - ny1) < h:
+        if ny1 <= 0.0:
+            ny2 = min(1.0, ny1 + h)
+        elif ny2 >= 1.0:
+            ny1 = max(0.0, ny2 - h)
+        changed = True
+
+    return [nx1, ny1, nx2, ny2], changed
+
+
+def _stabilize_matched_region_bbox(
+    overlay: Dict[str, Any],
+    region: Dict[str, Any],
+    overlay_zone: str,
+    appears_at: float,
+    temporal_state: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Stabilize matched region bbox across time and noisy detector outliers.
+
+    Uses:
+    - overlay bbox as corrective hint when region bbox is implausibly large;
+    - temporal smoothing per region/zone to suppress one-frame jumps;
+    - zone caps to avoid giant full-screen slabs.
+    """
+    if not region or not isinstance(region, dict):
+        return region
+    if not isinstance(region.get("bbox_norm"), (list, tuple)) or len(region.get("bbox_norm", [])) < 4:
+        return region
+
+    zone = _position_to_zone(region.get("zone") or overlay_zone or overlay.get("position", "middle"))
+    original_bbox = _normalize_bbox(region.get("bbox_norm", [0, 0.85, 1, 1]))
+    candidate_bbox = list(original_bbox)
+    reasons: List[str] = []
+
+    overlay_bbox = None
+    if isinstance(overlay.get("bbox_norm"), (list, tuple)) and len(overlay.get("bbox_norm", [])) >= 4:
+        overlay_bbox = _normalize_bbox(overlay.get("bbox_norm", [0, 0.85, 1, 1]))
+
+    # Correct giant region boxes with overlay-local hint.
+    if overlay_bbox:
+        region_area = _bbox_area_norm(original_bbox)
+        overlay_area = _bbox_area_norm(overlay_bbox)
+        iou = _bbox_iou_norm(original_bbox, overlay_bbox)
+        if overlay_area > 0:
+            if region_area > (overlay_area * 2.30) and iou < 0.25:
+                candidate_bbox = _blend_bbox_norm(original_bbox, overlay_bbox, 0.48)
+                reasons.append("overlay_blend_large_region")
+            elif region_area > 0.15 and iou < 0.08:
+                candidate_bbox = _blend_bbox_norm(original_bbox, overlay_bbox, 0.60)
+                reasons.append("overlay_blend_low_iou")
+
+    candidate_bbox, zone_clamped = _clamp_bbox_by_zone(candidate_bbox, zone)
+    if zone_clamped:
+        reasons.append("zone_cap")
+
+    region_id = str(region.get("id", "") or "")
+    temporal_key = f"region:{region_id}" if region_id else f"zone:{zone}"
+    prev_entry = temporal_state.get(temporal_key) or temporal_state.get(f"zone:{zone}")
+    if prev_entry and isinstance(prev_entry.get("bbox"), list):
+        prev_bbox = _normalize_bbox(prev_entry["bbox"])
+        prev_time = _safe_float(prev_entry.get("time"), appears_at)
+        delta_t = appears_at - prev_time
+
+        if 0.0 <= delta_t <= 8.0:
+            iou_prev = _bbox_iou_norm(prev_bbox, candidate_bbox)
+            prev_area = max(1e-9, _bbox_area_norm(prev_bbox))
+            curr_area = max(1e-9, _bbox_area_norm(candidate_bbox))
+            area_scale = curr_area / prev_area
+            px, py = _bbox_center_norm(prev_bbox)
+            cx, cy = _bbox_center_norm(candidate_bbox)
+            center_drift = max(abs(cx - px), abs(cy - py))
+
+            if (iou_prev < 0.10 and area_scale > 1.55) or center_drift > 0.22:
+                candidate_bbox = _blend_bbox_norm(prev_bbox, candidate_bbox, 0.25)
+                reasons.append("temporal_jump_guard")
+            elif iou_prev < 0.28 or area_scale > 1.30 or area_scale < 0.72:
+                candidate_bbox = _blend_bbox_norm(prev_bbox, candidate_bbox, 0.45)
+                reasons.append("temporal_smooth")
+
+            candidate_bbox, zone_clamped_2 = _clamp_bbox_by_zone(candidate_bbox, zone)
+            if zone_clamped_2 and "zone_cap" not in reasons:
+                reasons.append("zone_cap")
+
+    state_value = {"bbox": candidate_bbox, "time": appears_at}
+    temporal_state[temporal_key] = state_value
+    temporal_state[f"zone:{zone}"] = state_value
+
+    delta = max(abs(candidate_bbox[i] - original_bbox[i]) for i in range(4))
+    if delta < 1e-4:
+        return region
+
+    stabilized = dict(region)
+    stabilized["bbox_norm"] = candidate_bbox
+    logger.info(
+        "BBOX_STABILIZE: region=%s zone=%s reasons=%s "
+        "bbox=[%.3f,%.3f,%.3f,%.3f] -> [%.3f,%.3f,%.3f,%.3f]",
+        region.get("id", "?"),
+        zone,
+        ",".join(reasons) if reasons else "none",
+        original_bbox[0], original_bbox[1], original_bbox[2], original_bbox[3],
+        candidate_bbox[0], candidate_bbox[1], candidate_bbox[2], candidate_bbox[3],
+    )
+    return stabilized
+
+
+def _next_future_start(starts: list, current_t: float, min_gap: float = 0.35) -> Optional[float]:
+    """Get first future start timestamp with minimum gap from current time."""
+    if not starts:
+        return None
+    threshold = current_t + min_gap
+    for t in starts:
+        tv = _safe_float(t, -1.0)
+        if tv >= threshold:
+            return tv
+    return None
+
+
+def _apply_style_profile(region: Optional[Dict], default_bg_hex: str = "#1A1A1A",
+                         default_text_hex: str = "#FFFFFF", default_alpha: float = 0.08
+                         ) -> Dict[str, Any]:
+    """
+    Extract ASS-compatible style parameters from a text_region's style_profile.
+
+    Returns a dict with:
+        bg_hex, text_hex, bg_alpha, font_size_rel_factor, bold, outline, shadow, bg_color_ass, text_color_ass
+    If no style_profile exists, returns defaults (dark box with white text).
+    """
+    sp = (region or {}).get("style_profile", {}) if region else {}
+    if not sp:
+        return {
+            "bg_hex": default_bg_hex,
+            "text_hex": default_text_hex,
+            "bg_alpha": default_alpha,
+            "font_size_rel_factor": 1.0,
+            "bold": True,
+            "outline_width": 2,
+            "shadow_depth": 2,
+            "bg_color_ass": _hex_to_ass_color(default_bg_hex),
+            "text_color_ass": _hex_to_ass_color(default_text_hex),
+            "has_style_profile": False,
+        }
+
+    bg_hex = sp.get("bg_color", default_bg_hex)
+    text_hex = sp.get("text_color", default_text_hex)
+    opacity = _safe_float(sp.get("opacity"), 1.0)
+    # Convert opacity (1.0=opaque) to ASS alpha (0x00=opaque, 0xFF=transparent)
+    bg_alpha = max(0.0, 1.0 - opacity)
+
+    # Font size relative factor
+    size_map = {"small": 0.75, "medium": 1.0, "large": 1.25}
+    font_size_rel = size_map.get(sp.get("font_size_rel", "medium"), 1.0)
+
+    bold = sp.get("font_weight", "normal") == "bold"
+    # V5: Thinner outlines for modern TikTok look (min 1, not 0)
+    outline_width = 2 if sp.get("has_outline", False) else 1
+    shadow_depth = 1 if sp.get("has_shadow", False) else 1
+
+    return {
+        "bg_hex": bg_hex,
+        "text_hex": text_hex,
+        "bg_alpha": bg_alpha,
+        "font_size_rel_factor": font_size_rel,
+        "bold": bold,
+        "outline_width": outline_width,
+        "shadow_depth": shadow_depth,
+        "bg_color_ass": _hex_to_ass_color(bg_hex),
+        "text_color_ass": _hex_to_ass_color(text_hex),
+        "has_style_profile": True,
+    }
+
+
+def _estimate_overlay_max_hold_seconds(
+    translated_text: str,
+    region: Optional[Dict[str, Any]],
+    strategy: str,
+) -> float:
+    """
+    Estimate max safe on-screen duration for one overlay to prevent slab buildup.
+    """
+    text = (translated_text or "").strip()
+    words = [w for w in text.split() if w.strip()]
+    word_count = len(words)
+    char_count = len(text)
+
+    if word_count <= 2 and char_count <= 14:
+        hold = 3.2
+    elif word_count <= 6:
+        hold = 4.8
+    elif word_count <= 12:
+        hold = 6.6
+    else:
+        hold = 8.4
+
+    # Overlay pipelines should not linger too long by default.
+    if strategy in ("subtitle_snap", "blur_plate_overlay"):
+        hold = min(hold, 8.5)
+
+    if region and isinstance(region, dict):
+        temporal = str(region.get("temporal", "")).lower()
+        rtype = str(region.get("type", "")).lower()
+
+        if temporal == "static":
+            # Static text is visible throughout the video — allow full duration.
+            # Return a very large number; the caller will clamp to video_duration.
+            return 999999.0
+        if rtype in ("watermark", "logo", "username"):
+            hold = max(hold, 12.0)
+        if rtype in ("caption", "subtitle"):
+            hold = min(hold, 8.0)
+        if rtype in ("title", "headline"):
+            hold = max(hold, 10.0)
+
+    return max(2.0, min(14.0, hold))
 
 
 def _match_overlay_to_region(overlay: Dict, text_regions: list) -> Optional[Dict]:
@@ -2602,12 +4018,28 @@ def _match_overlay_to_region(overlay: Dict, text_regions: list) -> Optional[Dict
     Matches by:
     1. Position zone similarity (top/middle/bottom)
     2. Text content overlap (Levenshtein ratio)
+    3. BBox overlap (IoU) when both sides provide bbox_norm
     """
     if not text_regions:
         return None
 
+    # Deterministic direct match if server provided stable region_id link.
+    overlay_region_id = str(
+        overlay.get("region_id")
+        or overlay.get("text_region_id")
+        or ""
+    ).strip()
+    if overlay_region_id:
+        for region in text_regions:
+            if str(region.get("id", "")).strip() == overlay_region_id:
+                return region
+
     overlay_pos = overlay.get("position", "top").lower()
+    overlay_zone = _position_to_zone(overlay_pos)
     overlay_text = overlay.get("text", "")
+    overlay_bbox = None
+    if isinstance(overlay.get("bbox_norm"), (list, tuple)) and len(overlay.get("bbox_norm", [])) >= 4:
+        overlay_bbox = _normalize_bbox(overlay.get("bbox_norm", [0, 0, 1, 1]))
 
     best_match = None
     best_score = 0.0
@@ -2617,24 +4049,30 @@ def _match_overlay_to_region(overlay: Dict, text_regions: list) -> Optional[Dict
 
         # Zone match bonus
         region_zone = region.get("zone", "top")
-        if overlay_pos == region_zone:
-            score += 0.5
-        elif (overlay_pos in ("top", "top_left", "top_right") and region_zone == "top"):
-            score += 0.4
-        elif (overlay_pos in ("bottom", "bottom_left", "bottom_right") and region_zone == "bottom"):
-            score += 0.4
+        if overlay_zone == region_zone:
+            score += 0.35
 
         # Text similarity (source text)
         region_text = region.get("content", "")
         if overlay_text and region_text:
             text_sim = _levenshtein_ratio(overlay_text, region_text)
-            score += text_sim * 0.5
+            score += text_sim * 0.55
+
+        # BBox overlap (helps avoid matching top overlay to bottom region and vice versa)
+        if overlay_bbox and isinstance(region.get("bbox_norm"), (list, tuple)) and len(region.get("bbox_norm", [])) >= 4:
+            region_bbox = _normalize_bbox(region.get("bbox_norm", [0, 0, 1, 1]))
+            iou = _bbox_iou_norm(overlay_bbox, region_bbox)
+            if iou > 0:
+                score += min(0.8, iou * 1.3)
+            elif overlay_zone == region_zone:
+                # Same-zone but zero overlap is a strong anti-signal (often wrong region).
+                score -= 0.15
 
         if score > best_score:
             best_score = score
             best_match = region
 
-    if best_score >= 0.3:
+    if best_score >= 0.45:
         return best_match
     return None
 
@@ -2647,7 +4085,7 @@ def _render_backplate_overlay(ass_lines: list, overlay: Dict, region: Dict, vide
     Layer 0: Dark opaque rectangle covering original text bbox (hides source text)
     Layer 1: White text with auto-sized dark box (BorderStyle=3) for native look
     """
-    bbox = region.get("bbox_norm", [0, 0, 1, 0.15])
+    bbox = _normalize_bbox(region.get("bbox_norm", [0, 0, 1, 0.15]), video_width, video_height)
 
     # Convert normalized bbox to pixel coords
     # Use generous padding (8%) to ensure full coverage of original text + shadows/glow
@@ -2667,15 +4105,22 @@ def _render_backplate_overlay(ass_lines: list, overlay: Dict, region: Dict, vide
     start_time = _format_ass_time(overlay.get("appears_at", 0))
     end_time = _format_ass_time(overlay.get("disappears_at", 0))
 
-    # Layer 0: FULLY OPAQUE dark rectangle covering original text area
-    # alpha 0x00 = 100% opaque — any translucency causes ghost text bleed-through
+    # Apply style_profile from Gemini analysis (if available)
+    sp = _apply_style_profile(region, default_bg_hex="#0A0A0A", default_text_hex="#FFFFFF", default_alpha=0.0)
+
+    # Layer 0: Rectangle covering original text area using style-matched colors
+    bg_ass = sp["bg_color_ass"]
+    bg_alpha_hex = f"{int(sp['bg_alpha'] * 255):02X}"
+    # Use 95% opacity minimum to ensure source text is hidden
+    if int(bg_alpha_hex, 16) > 0x0D:
+        bg_alpha_hex = "0D"  # Cap at 95% opaque for backplates
     draw_cmd = f"m {x1} {y1} l {x2} {y1} l {x2} {y2} l {x1} {y2}"
     ass_lines.append(
         f"Dialogue: 0,{start_time},{end_time},BackPlate,,0,0,0,,"
-        f"{{\\an7\\pos(0,0)\\1c&H0A0A0A\\1a&H00\\bord0\\shad0\\p1}}{draw_cmd}"
+        f"{{\\an7\\pos(0,0)\\1c{bg_ass}\\1a&H{bg_alpha_hex}\\bord0\\shad0\\blur1\\p1}}{draw_cmd}"
     )
 
-    # Layer 1: Translated text with BackPlateBox style (auto-sized dark box)
+    # Layer 1: Translated text with style-matched colors
     translated_text = overlay.get("translated_text", "")
     wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=28)
     safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
@@ -2692,71 +4137,49 @@ def _render_backplate_overlay(ass_lines: list, overlay: Dict, region: Dict, vide
             pass
         style_name = "BackPlateBoxRTL"
 
+    # Build text overrides from style_profile
+    text_ass = sp["text_color_ass"]
+    bold_tag = "\\b1" if sp["bold"] else ""
+    outline_tag = f"\\bord{sp['outline_width']}"
+    shadow_tag = f"\\shad{sp['shadow_depth']}"
+
     ass_lines.append(
         f"Dialogue: 1,{start_time},{end_time},{style_name},,0,0,0,,"
-        f"{{\\an5\\pos({cx},{cy})\\fad(200,200)}}{safe_text}"
+        f"{{\\an5\\pos({cx},{cy})\\fad(200,200)\\1c{text_ass}{bold_tag}{outline_tag}{shadow_tag}}}{safe_text}"
     )
 
     logger.info(
         f"BACKPLATE: region={region.get('id', '?')} "
-        f"bbox=({x1},{y1},{x2},{y2}) text='{translated_text[:30]}'"
+        f"bbox=({x1},{y1},{x2},{y2}) style_profile={sp['has_style_profile']} "
+        f"text='{translated_text[:30]}'"
     )
 
 
 def _render_subtitle_snap(ass_lines: list, overlay: Dict, region: Dict, video_width: int, video_height: int, font_size: int, is_rtl: bool = False, target_language: str = "", caption_style: dict = None):
     """
-    Pipeline A: Render translated subtitle with market-native styling.
+    Pipeline A: Render translated subtitle with style-cloned container.
 
-    Renders a background strip (style-dependent) covering original text area,
-    with bold translated text on top. Uses caption_style preset for:
-    - Strip appearance (solid dark, semi-transparent, gradient feel)
-    - Text color, outline, shadow from market preset
-    - Font size and spacing tuned per market
+    Instead of full-width opaque strips, renders a fitted rounded-rect
+    background sized to the text content. Supports per-overlay font_style:
+    - ios_default_bg: dark semi-transparent rounded rect, white text
+    - impact_shadow: no background, white text with black shadow
+    - minimal_outline: no background, white text with thin outline
+    - sticker: colored background, contrasting text
+    Falls back to caption_style preset for unrecognized styles.
     """
-    cs = dict(caption_style or CAPTION_STYLE_PRESETS["dubbed_strip"])
-    bbox = region.get("bbox_norm", [0, 0.85, 1, 1])
+    cs = dict(caption_style or CAPTION_STYLE_PRESETS["tiktok_pill"])
+    bbox = _normalize_bbox(region.get("bbox_norm", [0, 0.85, 1, 1]), video_width, video_height)
 
-    # subtitle_snap does NOT remove original text — background MUST be fully opaque
-    # bg_alpha in ASS convention: 0.0=fully opaque, 1.0=fully transparent
-    # Force 0% transparency (= 100% opaque) — must completely cover source text
-    cs["bg_alpha"] = 0.0
+    # Resolve per-overlay font_style (from Gemini manifest)
+    font_style = overlay.get("font_style", "ios_default_bg")
 
-    # Convert to pixels — full width strip for clean subtitle look
-    x1 = 0
-    y1 = max(0, int(bbox[1] * video_height) - 8)
-    x2 = video_width
-    y2 = min(video_height, int(bbox[3] * video_height) + 8)
-
-    # Ensure minimum strip height for readability
-    min_strip_h = int(video_height * cs["font_size_pct"] * 2.5)
-    if y2 - y1 < min_strip_h:
-        cy_center = (y1 + y2) // 2
-        y1 = max(0, cy_center - min_strip_h // 2)
-        y2 = min(video_height, cy_center + min_strip_h // 2)
-
-    cx = video_width // 2
-    cy = (y1 + y2) // 2
-
-    start_time = _format_ass_time(overlay.get("appears_at", 0))
-    end_time = _format_ass_time(overlay.get("disappears_at", 0))
-
-    # Layer 0: Background strip — style depends on caption preset
-    bg_color_ass = _hex_to_ass_color(cs["bg_color"])
-    bg_alpha_hex = f"{int(cs['bg_alpha'] * 255):02X}"
-
-    draw_cmd = f"m {x1} {y1} l {x2} {y1} l {x2} {y2} l {x1} {y2}"
-    ass_lines.append(
-        f"Dialogue: 0,{start_time},{end_time},BackPlate,,0,0,0,,"
-        f"{{\\an7\\pos(0,0)\\1c{bg_color_ass}\\1a&H{bg_alpha_hex}\\bord0\\shad0\\p1}}{draw_cmd}"
-    )
-
-    # Layer 1: Translated text with market-native styling
+    # Prepare translated text first (needed for fitted container sizing)
     translated_text = _strip_emoji(overlay.get("translated_text", ""))
-    max_chars = cs.get("max_chars_line", 32)
+    max_chars = max(12, min(_safe_int(cs.get("max_chars_line"), 28), 22))
     wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=max_chars)
     safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
 
-    style_name = "TranslatedText"
+    style_name = "TranslatedTextNoBox"
     if is_rtl:
         try:
             import arabic_reshaper
@@ -2765,17 +4188,189 @@ def _render_subtitle_snap(ass_lines: list, overlay: Dict, region: Dict, video_wi
             safe_text = get_display(reshaped)
         except ImportError:
             pass
-        style_name = "TranslatedTextRTL"
+        style_name = "TranslatedTextNoBoxRTL"
 
+    # Estimate text dimensions for fitted container
+    # Count lines and max line width in characters
+    text_lines = wrapped_text.split("\\N")
+    num_lines = len(text_lines)
+    max_line_chars = max(len(line) for line in text_lines) if text_lines else 1
+
+    # Approximate pixel width: ~0.55 * font_size per char (bold sans-serif average)
+    char_width = font_size * 0.55
+    text_pixel_w = int(max_line_chars * char_width)
+    text_pixel_h = int(num_lines * font_size * 1.3)  # 1.3x line height
+
+    # Padding around text inside the container.
+    pad_x = int(font_size * 0.42)
+    pad_y = int(font_size * 0.28)
+
+    # Container dimensions — sized to fit translated text only
+    # V5: Inpaint removes source text perfectly, so container is decorative only
+    text_container_w = text_pixel_w + pad_x * 2
+    text_container_h = text_pixel_h + pad_y * 2
+
+    # Original text bbox in pixels (used for positioning center, not sizing)
+    orig_w = int((bbox[2] - bbox[0]) * video_width)
+    orig_h = int((bbox[3] - bbox[1]) * video_height)
+
+    # Deterministic layout solver (policy layer).
+    zone = (region.get("zone") or _position_to_zone(overlay.get("position", "middle")) or "middle").lower()
+    style_intent = cs.get("_style_intent", {}) if isinstance(cs, dict) else {}
+    layout_policy = _build_layout_policy(
+        "subtitle_snap",
+        density=style_intent.get("density", "balanced"),
+        container_preference=style_intent.get("container_preference", "pill"),
+    )
+    # V5: Text-only sizing — no need to cover original bbox (inpaint handles removal)
+    container_w = text_container_w
+    container_h = text_container_h
+    container_w, container_h, guard_metrics = _enforce_container_guardrails(
+        container_w=container_w,
+        container_h=container_h,
+        orig_w=orig_w,
+        orig_h=orig_h,
+        text_container_w=text_container_w,
+        text_container_h=text_container_h,
+        font_size=font_size,
+        zone=zone,
+        video_width=video_width,
+        video_height=video_height,
+        layout_policy=layout_policy,
+    )
+    if guard_metrics.get("fallback_applied"):
+        logger.info(
+            "STYLE_GUARD: auto-compact applied region=%s zone=%s reasons=%s "
+            "raw_coverage=(%.2f,%.2f) eff_coverage=(%.2f,%.2f) area=%.3f",
+            region.get("id", "?"),
+            zone,
+            ",".join(guard_metrics.get("fallback_reasons", [])) or "none",
+            guard_metrics.get("coverage_x_raw", 0.0),
+            guard_metrics.get("coverage_y_raw", 0.0),
+            guard_metrics.get("coverage_x_eff", 0.0),
+            guard_metrics.get("coverage_y_eff", 0.0),
+            guard_metrics.get("area_ratio", 0.0),
+        )
+
+    # Position: center container over the ORIGINAL text bbox (not video center)
+    # This ensures the opaque container fully covers the source text
+    bbox_cx = int(((bbox[0] + bbox[2]) / 2) * video_width)
+    bbox_cy = int(((bbox[1] + bbox[3]) / 2) * video_height)
+    cx = bbox_cx
+    cy = bbox_cy
+
+    # Container top-left for ASS drawing
+    rect_x1 = cx - container_w // 2
+    rect_y1 = cy - container_h // 2
+    rect_x2 = cx + container_w // 2
+    rect_y2 = cy + container_h // 2
+
+    # Clamp to video bounds (with padding)
+    margin = 4
+    if rect_x1 < margin:
+        shift = margin - rect_x1
+        rect_x1 += shift
+        rect_x2 += shift
+        cx += shift
+    if rect_x2 > video_width - margin:
+        shift = rect_x2 - (video_width - margin)
+        rect_x1 -= shift
+        rect_x2 -= shift
+        cx -= shift
+    if rect_y1 < margin:
+        shift = margin - rect_y1
+        rect_y1 += shift
+        rect_y2 += shift
+        cy += shift
+    if rect_y2 > video_height - margin:
+        shift = rect_y2 - (video_height - margin)
+        rect_y1 -= shift
+        rect_y2 -= shift
+        cy -= shift
+
+    start_time = _format_ass_time(overlay.get("appears_at", 0))
+    end_time = _format_ass_time(overlay.get("disappears_at", 0))
+
+    # Corner radius for rounded rect (ASS bezier curves)
+    # V5: Larger radius for modern pill shape
+    R = max(10, min(int(font_size * 0.6), 18, container_w // 3, container_h // 3))
+
+    # Shorthand positions for the rounded rect
+    rx1, ry1, rx2, ry2 = rect_x1, rect_y1, rect_x2, rect_y2
+
+    # --- V5: Unified modern frosted pill for ALL subtitle_snap overlays ---
+    # Gemini font_style values don't match handler vocabulary (dead code eliminated).
+    # Inpaint/blur removes source text; overlay is purely decorative.
+    # Force ios_default_bg frosted pill for consistent modern TikTok look.
+
+    # Style: modern semi-transparent frosted pill
+    bg_hex = "#000000"
+    bg_alpha = 0.50  # 50% opacity — semi-transparent, modern look
+    text_color_ass = _hex_to_ass_color("#FFFFFF")
+    bold_tag = "\\b1"  # Bold for readability at small sizes
+    outline_tag = "\\bord1"  # Thin outline — modern TikTok style
+    shadow_tag = "\\shad1"
+    plate_blur = "\\blur6"  # Strong blur for frosted glass effect
+    plate_shad = ""  # No shadow on frosted glass plate
+
+    bg_color_ass = _hex_to_ass_color(bg_hex)
+    bg_alpha_hex = f"{int(bg_alpha * 255):02X}"
+
+    # Rounded-rect pill shape with smooth bezier quarter-circle corners
+    C = int(R * 0.55)
+    draw_cmd = (
+        f"m {rx1+R} {ry1} "
+        f"l {rx2-R} {ry1} "
+        f"b {rx2-R+C} {ry1} {rx2} {ry1+R-C} {rx2} {ry1+R} "
+        f"l {rx2} {ry2-R} "
+        f"b {rx2} {ry2-R+C} {rx2-R+C} {ry2} {rx2-R} {ry2} "
+        f"l {rx1+R} {ry2} "
+        f"b {rx1+R-C} {ry2} {rx1} {ry2-R+C} {rx1} {ry2-R} "
+        f"l {rx1} {ry1+R} "
+        f"b {rx1} {ry1+R-C} {rx1+R-C} {ry1} {rx1+R} {ry1}"
+    )
+
+    # BackPlate: frosted pill with fade-out to prevent ghost rectangle
+    ass_lines.append(
+        f"Dialogue: 0,{start_time},{end_time},BackPlate,,0,0,0,,"
+        f"{{\\an7\\pos(0,0)\\fad(0,200)\\1c{bg_color_ass}\\1a&H{bg_alpha_hex}\\bord0{plate_shad}{plate_blur}\\p1}}{draw_cmd}"
+    )
+
+    # Text: white bold with thin outline, centered inside the pill
+    text_overrides = f"\\an5\\pos({cx},{cy})\\fad(150,200)\\1c{text_color_ass}{bold_tag}{outline_tag}\\3c&H000000{shadow_tag}\\4c&H70000000"
     ass_lines.append(
         f"Dialogue: 1,{start_time},{end_time},{style_name},,0,0,0,,"
-        f"{{\\an5\\pos({cx},{cy})\\fad(150,150)}}{safe_text}"
+        f"{{{text_overrides}}}{safe_text}"
     )
+
+    # Hard QA metrics (deterministic checks before model-based QA).
+    coverage_x_raw = guard_metrics.get("coverage_x_raw", container_w / max(1, orig_w))
+    coverage_y_raw = guard_metrics.get("coverage_y_raw", container_h / max(1, orig_h))
+    coverage_x_eff = guard_metrics.get("coverage_x_eff", coverage_x_raw)
+    coverage_y_eff = guard_metrics.get("coverage_y_eff", coverage_y_raw)
+    area_ratio = guard_metrics.get("area_ratio", (container_w * container_h) / max(1, video_width * video_height))
+    if guard_metrics.get("coverage_low", False):
+        logger.warning(
+            f"STYLE_GUARD: low source coverage region={region.get('id', '?')} "
+            f"zone={zone} raw=({coverage_x_raw:.2f},{coverage_y_raw:.2f}) "
+            f"eff=({coverage_x_eff:.2f},{coverage_y_eff:.2f})"
+        )
+    if guard_metrics.get("oversized", False):
+        logger.warning(
+            f"STYLE_GUARD: oversized container region={region.get('id', '?')} "
+            f"zone={zone} area_ratio={area_ratio:.3f} "
+            f"max={guard_metrics.get('max_area_ratio', 0.16):.3f}"
+        )
 
     logger.info(
         f"SUBTITLE_SNAP: region={region.get('id', '?')} "
-        f"strip=({x1},{y1},{x2},{y2}) alpha=0x{int(cs['bg_alpha']*255):02X} "
-        f"text='{translated_text[:30]}'"
+        f"container=({rect_x1},{rect_y1},{rect_x2},{rect_y2}) R={R} "
+        f"zone={zone} coverage_raw=({coverage_x_raw:.2f},{coverage_y_raw:.2f}) "
+        f"coverage_eff=({coverage_x_eff:.2f},{coverage_y_eff:.2f}) "
+        f"font_style='{font_style}' render_style='ios_default_bg_v5' "
+        f"bg_alpha={bg_alpha} plate_blur='{plate_blur}' "
+        f"time={start_time}-{end_time} "
+        f"text='{translated_text[:40]}'"
     )
 
 
@@ -2784,13 +4379,13 @@ def _render_blur_plate_overlay(ass_lines: list, overlay: Dict, region: Dict, vid
     Pipeline B: Render translated text on already-blurred region.
 
     The blur_plate stage has already applied gaussian blur + darken to the region.
-    Text is rendered with market-native styling on top of the blurred area.
-    The blur provides the background — no additional plate needed.
+    Uses a fitted rounded-rect backup container (not full-width) that covers
+    the original text area. Text is rendered with market-native styling on top.
     """
     cs = dict(caption_style or CAPTION_STYLE_PRESETS["tiktok_pill"])
-    bbox = region.get("bbox_norm", [0, 0.85, 1, 1])
+    bbox = _normalize_bbox(region.get("bbox_norm", [0, 0.85, 1, 1]), video_width, video_height)
 
-    # Convert to pixels
+    # Convert to pixels — use the actual region bbox, not full width
     x1 = max(0, int(bbox[0] * video_width))
     y1 = max(0, int(bbox[1] * video_height))
     x2 = min(video_width, int(bbox[2] * video_width))
@@ -2803,11 +4398,11 @@ def _render_blur_plate_overlay(ass_lines: list, overlay: Dict, region: Dict, vid
     end_time = _format_ass_time(overlay.get("disappears_at", 0))
 
     translated_text = _strip_emoji(overlay.get("translated_text", ""))
-    max_chars = cs.get("max_chars_line", 28)
+    max_chars = max(14, min(_safe_int(cs.get("max_chars_line"), 28), 28))
     wrapped_text = _wrap_text_for_ass(translated_text, max_chars_per_line=max_chars)
     safe_text = wrapped_text.replace("{", "\\{").replace("}", "\\}")
 
-    style_name = "TranslatedText"
+    style_name = "TranslatedTextNoBox"
     if is_rtl:
         try:
             import arabic_reshaper
@@ -2816,29 +4411,265 @@ def _render_blur_plate_overlay(ass_lines: list, overlay: Dict, region: Dict, vid
             safe_text = get_display(reshaped)
         except ImportError:
             pass
-        style_name = "TranslatedTextRTL"
+        style_name = "TranslatedTextNoBoxRTL"
 
-    # Layer 0: Opaque backup background — MUST cover original text even if blur failed
-    bg_color_ass = _hex_to_ass_color(cs.get("bg_color", "#0A0A0A"))
-    # 95% opaque backup (ASS: 0x0D = 5% transparent)
-    draw_cmd = f"m {x1} {y1} l {x2} {y1} l {x2} {y2} l {x1} {y2}"
+    # Estimate text dimensions for fitted container
+    text_lines = wrapped_text.split("\\N")
+    num_lines = len(text_lines)
+    max_line_chars = max(len(line) for line in text_lines) if text_lines else 1
+    char_width = font_size * 0.55
+    text_pixel_w = int(max_line_chars * char_width)
+    text_pixel_h = int(num_lines * font_size * 1.3)
+
+    # Container must cover original text area OR fit translated text.
+    pad_x = int(font_size * 0.55)
+    pad_y = int(font_size * 0.35)
+    text_container_w = text_pixel_w + pad_x * 2
+    text_container_h = text_pixel_h + pad_y * 2
+    region_w = x2 - x1
+    region_h = y2 - y1
+
+    zone = (region.get("zone") or _position_to_zone(overlay.get("position", "middle")) or "middle").lower()
+    style_intent = cs.get("_style_intent", {}) if isinstance(cs, dict) else {}
+    layout_policy = _build_layout_policy(
+        "blur_plate",
+        density=style_intent.get("density", "balanced"),
+        container_preference=style_intent.get("container_preference", "pill"),
+    )
+    container_w, container_h = _solve_container_dimensions(
+        orig_w=region_w,
+        orig_h=region_h,
+        text_container_w=text_container_w,
+        text_container_h=text_container_h,
+        font_size=font_size,
+        zone=zone,
+        video_width=video_width,
+        video_height=video_height,
+        layout_policy=layout_policy,
+    )
+    container_w, container_h, guard_metrics = _enforce_container_guardrails(
+        container_w=container_w,
+        container_h=container_h,
+        orig_w=region_w,
+        orig_h=region_h,
+        text_container_w=text_container_w,
+        text_container_h=text_container_h,
+        font_size=font_size,
+        zone=zone,
+        video_width=video_width,
+        video_height=video_height,
+        layout_policy=layout_policy,
+    )
+    if guard_metrics.get("fallback_applied"):
+        logger.info(
+            "BLUR_STYLE_GUARD: auto-compact region=%s zone=%s reasons=%s "
+            "raw_coverage=(%.2f,%.2f) eff_coverage=(%.2f,%.2f) area=%.3f",
+            region.get("id", "?"),
+            zone,
+            ",".join(guard_metrics.get("fallback_reasons", [])) or "none",
+            guard_metrics.get("coverage_x_raw", 0.0),
+            guard_metrics.get("coverage_y_raw", 0.0),
+            guard_metrics.get("coverage_x_eff", 0.0),
+            guard_metrics.get("coverage_y_eff", 0.0),
+            guard_metrics.get("area_ratio", 0.0),
+        )
+
+    # Fitted container position (centered on original region center)
+    rx1 = cx - container_w // 2
+    ry1 = cy - container_h // 2
+    rx2 = cx + container_w // 2
+    ry2 = cy + container_h // 2
+
+    # Clamp to video bounds
+    rx1 = max(0, rx1)
+    ry1 = max(0, ry1)
+    rx2 = min(video_width, rx2)
+    ry2 = min(video_height, ry2)
+
+    # Corner radius for rounded rect
+    R = min(int(font_size * 0.4), 12, container_w // 4, container_h // 4)
+
+    # Apply style_profile from Gemini analysis (if available)
+    sp = _apply_style_profile(region, default_bg_hex="#0A0A0A", default_text_hex="#FFFFFF", default_alpha=0.1)
+
+    # Layer 0: Fitted rounded-rect backup background with style-matched color
+    bg_color_ass = sp["bg_color_ass"]
+    bg_alpha_hex = f"{int(sp['bg_alpha'] * 255):02X}"
+    # Blur plate already obscures text; cap transparency at 90% opaque
+    if int(bg_alpha_hex, 16) > 0x1A:
+        bg_alpha_hex = "1A"
+    draw_cmd = (
+        f"m {rx1+R} {ry1} "
+        f"l {rx2-R} {ry1} "
+        f"b {rx2} {ry1} {rx2} {ry1+R} {rx2} {ry1+R} "
+        f"l {rx2} {ry2-R} "
+        f"b {rx2} {ry2} {rx2-R} {ry2} {rx2-R} {ry2} "
+        f"l {rx1+R} {ry2} "
+        f"b {rx1} {ry2} {rx1} {ry2-R} {rx1} {ry2-R} "
+        f"l {rx1} {ry1+R} "
+        f"b {rx1} {ry1} {rx1+R} {ry1} {rx1+R} {ry1}"
+    )
     ass_lines.append(
         f"Dialogue: 0,{start_time},{end_time},BackPlate,,0,0,0,,"
-        f"{{\\an7\\pos(0,0)\\1c{bg_color_ass}\\1a&H0D\\bord0\\shad0\\p1}}{draw_cmd}"
+        f"{{\\an7\\pos(0,0)\\1c{bg_color_ass}\\1a&H{bg_alpha_hex}\\bord0\\shad0\\p1}}{draw_cmd}"
     )
 
-    # Layer 1: Text with shadow for readability on blurred background
-    shadow_color = _hex_to_ass_color(cs.get("shadow_color", "#000000"))
+    # Layer 1: Text on blurred background
+    # CRITICAL: Blur plate creates a DARK background. Style profile text colors are designed
+    # for the ORIGINAL background, not the blur. Dark text on dark blur = invisible.
+    # Always use white text with strong outline for readability on blur.
+    text_ass = _hex_to_ass_color("#FFFFFF")
+    bold_tag = "\\b1"
+    outline_tag = "\\bord3"
+    shadow_tag = "\\shad2"
+    shadow_color = _hex_to_ass_color("#000000")
     ass_lines.append(
         f"Dialogue: 1,{start_time},{end_time},{style_name},,0,0,0,,"
-        f"{{\\an5\\pos({cx},{cy})\\fad(200,200)\\shad3\\3c{shadow_color}}}{safe_text}"
+        f"{{\\an5\\pos({cx},{cy})\\fad(200,200)\\1c{text_ass}{bold_tag}{outline_tag}{shadow_tag}\\3c{shadow_color}}}{safe_text}"
     )
 
+    coverage_x_raw = guard_metrics.get("coverage_x_raw", container_w / max(1, region_w))
+    coverage_y_raw = guard_metrics.get("coverage_y_raw", container_h / max(1, region_h))
+    coverage_x_eff = guard_metrics.get("coverage_x_eff", coverage_x_raw)
+    coverage_y_eff = guard_metrics.get("coverage_y_eff", coverage_y_raw)
+    area_ratio = guard_metrics.get("area_ratio", (container_w * container_h) / max(1, video_width * video_height))
+    if guard_metrics.get("coverage_low", False):
+        logger.warning(
+            f"BLUR_STYLE_GUARD: low source coverage region={region.get('id', '?')} "
+            f"zone={zone} raw=({coverage_x_raw:.2f},{coverage_y_raw:.2f}) "
+            f"eff=({coverage_x_eff:.2f},{coverage_y_eff:.2f})"
+        )
+    if guard_metrics.get("oversized", False):
+        logger.warning(
+            f"BLUR_STYLE_GUARD: oversized container region={region.get('id', '?')} "
+            f"zone={zone} area_ratio={area_ratio:.3f} "
+            f"max={guard_metrics.get('max_area_ratio', 0.16):.3f}"
+        )
     logger.info(
         f"BLUR_PLATE_OVERLAY: region={region.get('id', '?')} "
-        f"pos=({cx},{cy}) alpha=0x0D "
-        f"text='{translated_text[:30]}'"
+        f"container=({rx1},{ry1},{rx2},{ry2}) R={R} "
+        f"zone={zone} coverage_raw=({coverage_x_raw:.2f},{coverage_y_raw:.2f}) "
+        f"coverage_eff=({coverage_x_eff:.2f},{coverage_y_eff:.2f}) "
+        f"time={start_time}-{end_time} "
+        f"text='{translated_text[:40]}'"
     )
+
+
+def _refine_regions_from_ocr(text_regions: list, text_detections: list) -> list:
+    """Refine Gemini text_region bboxes using precise OCR detections.
+
+    For each Gemini region, find overlapping OCR detections and expand
+    the region bbox to cover ALL matched detections. This ensures
+    subtitle_snap containers fully cover original text.
+    """
+    if not text_detections or not text_regions:
+        return text_regions
+
+    for region in text_regions:
+        bbox = region.get("bbox_norm", [0, 0.85, 1, 1])
+        region_zone = region.get("zone", "middle")
+        region_w = max(1e-4, bbox[2] - bbox[0])
+        region_h = max(1e-4, bbox[3] - bbox[1])
+
+        # Expand search area moderately; aggressive expansion causes giant merged slabs.
+        margin_x = max(0.02, min(0.08, region_w * 0.35))
+        margin_y = max(0.015, min(0.07, region_h * 0.45))
+        search_x1 = max(0, bbox[0] - margin_x)
+        search_y1 = max(0, bbox[1] - margin_y)
+        search_x2 = min(1, bbox[2] + margin_x)
+        search_y2 = min(1, bbox[3] + margin_y)
+        region_cx = (bbox[0] + bbox[2]) / 2
+        region_cy = (bbox[1] + bbox[3]) / 2
+
+        matched_dets = []
+        for det in text_detections:
+            det_bbox = det.get("bbox_norm", [0, 0, 0, 0])
+            det_x1, det_y1, det_x2, det_y2 = det_bbox[0], det_bbox[1], det_bbox[2], det_bbox[3]
+
+            # Overlap-based matching: calculate bbox overlap between OCR det and expanded region
+            overlap_x = max(0.0, min(det_x2, search_x2) - max(det_x1, search_x1))
+            overlap_y = max(0.0, min(det_y2, search_y2) - max(det_y1, search_y1))
+            overlap_area = overlap_x * overlap_y
+            det_area = max(1e-6, (det_x2 - det_x1) * (det_y2 - det_y1))
+            overlap_ratio = overlap_area / det_area
+
+            if overlap_ratio < 0.05:
+                continue  # Skip only if truly no overlap with expanded search area
+
+            # Zone penalty: penalize score instead of hard reject
+            zone_penalty = 0.0
+            if region_zone == "bottom" and det_y1 < 0.35:
+                zone_penalty = 0.3
+            elif region_zone == "top" and det_y2 > 0.65:
+                zone_penalty = 0.3
+            elif region_zone == "middle" and not (det_y1 < 0.75 and det_y2 > 0.25):
+                zone_penalty = 0.2
+
+            # Center-distance check (soft)
+            det_cx = (det_x1 + det_x2) / 2
+            det_cy = (det_y1 + det_y2) / 2
+            max_dx = region_w * 0.75 + 0.06
+            max_dy = region_h * 0.90 + 0.08
+            close_enough = abs(det_cx - region_cx) <= max_dx and abs(det_cy - region_cy) <= max_dy
+
+            # Combined score: overlap strength minus zone penalty
+            match_score = overlap_ratio - zone_penalty
+
+            if close_enough and match_score > 0.0:
+                matched_dets.append(det_bbox)
+
+        if matched_dets:
+            # OCR union
+            ocr_x1 = min(b[0] for b in matched_dets)
+            ocr_y1 = min(b[1] for b in matched_dets)
+            ocr_x2 = max(b[2] for b in matched_dets)
+            ocr_y2 = max(b[3] for b in matched_dets)
+
+            # Compare Gemini bbox area vs OCR area.
+            # If Gemini bbox is heavily over-wide, trust OCR more to avoid giant subtitle blocks.
+            orig_area = max(1e-9, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+            ocr_area = max(1e-9, (ocr_x2 - ocr_x1) * (ocr_y2 - ocr_y1))
+            if ocr_area > (orig_area * 1.6):
+                logger.info(
+                    f"OCR_REFINE: region={region.get('id', '?')} skipped (ocr area too large: "
+                    f"orig={orig_area:.4f}, ocr={ocr_area:.4f})"
+                )
+                continue
+            use_ocr_only = orig_area > (ocr_area * 1.8)
+
+            if use_ocr_only:
+                margin_x = 0.01
+                margin_y = 0.015
+                union_x1 = max(0.0, ocr_x1 - margin_x)
+                union_y1 = max(0.0, ocr_y1 - margin_y)
+                union_x2 = min(1.0, ocr_x2 + margin_x)
+                union_y2 = min(1.0, ocr_y2 + margin_y)
+            else:
+                # Standard union: keep Gemini guidance + OCR precision
+                all_bboxes = [bbox] + matched_dets
+                union_x1 = min(b[0] for b in all_bboxes)
+                union_y1 = min(b[1] for b in all_bboxes)
+                union_x2 = max(b[2] for b in all_bboxes)
+                union_y2 = max(b[3] for b in all_bboxes)
+
+            # Clamp refinement growth to reduce accidental over-expansion.
+            max_expand_x = max(0.05, region_w * 0.35)
+            max_expand_y = max(0.05, region_h * 0.45)
+            union_x1 = max(0.0, max(union_x1, bbox[0] - max_expand_x))
+            union_y1 = max(0.0, max(union_y1, bbox[1] - max_expand_y))
+            union_x2 = min(1.0, min(union_x2, bbox[2] + max_expand_x))
+            union_y2 = min(1.0, min(union_y2, bbox[3] + max_expand_y))
+
+            old_bbox = region["bbox_norm"]
+            region["bbox_norm"] = [union_x1, union_y1, union_x2, union_y2]
+            logger.info(
+                f"OCR_REFINE: region={region.get('id', '?')} matched {len(matched_dets)} OCR dets, "
+                f"mode={'ocr_only' if use_ocr_only else 'union'} "
+                f"bbox [{old_bbox[0]:.3f},{old_bbox[1]:.3f},{old_bbox[2]:.3f},{old_bbox[3]:.3f}] → "
+                f"[{union_x1:.3f},{union_y1:.3f},{union_x2:.3f},{union_y2:.3f}]"
+            )
+
+    return text_regions
 
 
 def _generate_ass_subtitles(
@@ -2876,9 +4707,36 @@ def _generate_ass_subtitles(
     text_regions = (video_profile or {}).get("text_regions", [])
     render_strategies = vp_config.get("render_strategy", {})
 
-    # Determine dominant pipeline type for style resolution
-    pipelines_used = vp_config.get("pipelines_used", [])
-    dominant_pipeline = pipelines_used[0] if pipelines_used else "inpaint_backplate"
+    # Determine dominant pipeline type for style resolution (deterministic).
+    # Do not trust pipelines_used order from upstream set/list conversions.
+    strategy_to_pipeline = {
+        "subtitle_snap": "subtitle_snap",
+        "blur_plate_overlay": "blur_plate",
+        "backplate_overlay": "inpaint_backplate",
+        "replace_inplace": "inpaint_backplate",
+    }
+    strategy_counts: Dict[str, int] = {}
+    for _rid, _strategy in (render_strategies or {}).items():
+        strategy_counts[_strategy] = strategy_counts.get(_strategy, 0) + 1
+
+    dominant_pipeline = "inpaint_backplate"
+    if strategy_counts:
+        priority = {"subtitle_snap": 4, "blur_plate_overlay": 3, "backplate_overlay": 2, "replace_inplace": 1}
+        dominant_strategy = sorted(
+            strategy_counts.keys(),
+            key=lambda s: (strategy_counts.get(s, 0), priority.get(s, 0)),
+            reverse=True,
+        )[0]
+        dominant_pipeline = strategy_to_pipeline.get(dominant_strategy, "inpaint_backplate")
+    else:
+        pipelines_used = vp_config.get("pipelines_used", [])
+        if pipelines_used:
+            pref = {"subtitle_snap": 4, "blur_plate": 3, "inpaint_backplate": 2}
+            dominant_pipeline = sorted(
+                pipelines_used,
+                key=lambda p: pref.get(p, 0),
+                reverse=True,
+            )[0]
 
     # Extract Gemini-generated target caption style from video_profile
     target_caption_style = (video_profile or {}).get("target_caption_style")
@@ -2928,30 +4786,230 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     ass_lines = []  # Collect dialogue lines
 
+    # Pre-compute future overlay starts by position and by canonical zone.
+    # Zone index avoids overlap when Gemini alternates labels like top/top_left.
+    _next_start_by_pos = {}
+    _next_start_by_zone = {"top": [], "middle": [], "bottom": []}
+    for i, ov in enumerate(translated_overlays):
+        pos = ov.get("position", "top")
+        t = ov.get("appears_at", 0.0)
+        tv = _safe_float(t, 0.0)
+        _next_start_by_pos.setdefault(pos, []).append(tv)
+        _next_start_by_zone.setdefault(_position_to_zone(pos), []).append(tv)
+    for pos in _next_start_by_pos:
+        _next_start_by_pos[pos] = sorted(_next_start_by_pos[pos])
+    for zone in _next_start_by_zone:
+        _next_start_by_zone[zone] = sorted(_next_start_by_zone[zone])
+
+    # Temporal state for bbox stabilization (per region + per zone fallback).
+    _bbox_temporal_state: Dict[str, Dict[str, Any]] = {}
+    # Duplicate suppression per zone to avoid stacked identical overlays.
+    _zone_dedupe_state: Dict[str, Dict[str, Any]] = {}
+
     for i, overlay in enumerate(translated_overlays):
         translated_text = _strip_emoji(overlay.get("translated_text", ""))
         if not translated_text:
             continue
 
+        # Garbage text validation: reject high-entropy alphanumeric noise
+        # e.g. "5ef4re3ft2r.. 1" — corrupted OCR output that should not be rendered
+        import re as _re_validate
+        alpha_count = sum(1 for c in translated_text if c.isalpha())
+        digit_count = sum(1 for c in translated_text if c.isdigit())
+        total_alnum = alpha_count + digit_count
+        _is_garbage = False
+        if total_alnum > 3 and digit_count > 0:
+            digit_ratio = digit_count / total_alnum
+            # High digit-to-alpha mixing = likely garbage (normal text has <10% digits)
+            if digit_ratio > 0.25 and len(translated_text) < 30:
+                # Additional check: does it look like a random hash?
+                has_mixed_runs = bool(_re_validate.search(r'[a-zA-Z]\d|\d[a-zA-Z]', translated_text))
+                if has_mixed_runs:
+                    _is_garbage = True
+
+        # Detect OCR-concatenated text: "THatitookme#romi64kg", "Snd:lookingdlikethis"
+        # Patterns: long runs without spaces, embedded hashtags/colons, camelCase mid-word
+        if not _is_garbage and len(translated_text) > 12:
+            space_count = translated_text.count(" ")
+            word_ratio = space_count / max(1, len(translated_text))
+            # Normal text has ~1 space per 5-6 chars; OCR concat has almost none
+            if word_ratio < 0.04 and alpha_count > 10:
+                # Check for embedded hashtags, colons, or erratic casing
+                has_concat_markers = bool(_re_validate.search(r'[a-z]#|#[a-z]|[a-z]:[a-z]', translated_text))
+                has_erratic_case = len(_re_validate.findall(r'[a-z][A-Z]', translated_text)) >= 2
+                if has_concat_markers or has_erratic_case:
+                    _is_garbage = True
+
+        if _is_garbage:
+            logger.warning(
+                f"RENDER_TEXT ASS [{i}]: GARBAGE TEXT REJECTED: '{translated_text}' "
+                f"(likely OCR concatenation, not proper translation)"
+            )
+            continue
+
         appears_at = overlay.get("appears_at", 0.0)
         disappears_at = overlay.get("disappears_at", 0.0)
         position = overlay.get("position", "top")
+        overlay_zone = _position_to_zone(position)
 
-        # Only extend to video end if Gemini didn't provide disappears_at (0 or missing)
-        # DO NOT extend short overlays — they should disappear when the original text does
-        if disappears_at <= 0:
+        # FIX: ASS timing bug — overlays starting at 0.0 don't render on frame 0.
+        # ASS "0:00:00.00" start is sometimes skipped by renderers on the very first
+        # frame. Shift to -0.05s so the subtitle is already active at t=0.
+        if appears_at < 0.05:
+            appears_at = -0.05
+
+        # Check if the matched text_region is "static" (visible throughout video).
+        # Static regions should always span the full video duration regardless of
+        # model-provided timestamps, which are often wrong (e.g., disappears_at=5.0
+        # for text that's visible for 44 seconds).
+        matched_region_for_timing = _match_overlay_to_region(overlay, text_regions) if text_regions else None
+        is_static_region = (
+            matched_region_for_timing
+            and str(matched_region_for_timing.get("temporal", "")).lower() == "static"
+            and not overlay.get("type") == "countdown"  # Countdowns are NOT static
+        )
+
+        # Check model-provided end time.
+        model_end_raw = _safe_float(overlay.get("disappears_at"), 0.0)
+        model_end_valid = (
+            model_end_raw > (appears_at + 0.3)
+            and model_end_raw <= (video_duration + 0.5)
+        )
+
+        # For static regions, model timing is often wrong (e.g. 12s for text
+        # visible throughout a 44s video). Only trust model timing for static
+        # regions if it covers >50% of video duration; otherwise extend to full.
+        if is_static_region and model_end_valid and video_duration > 0:
+            model_coverage = (model_end_raw - appears_at) / video_duration
+            if model_coverage < 0.50:
+                logger.info(
+                    f"RENDER_TEXT ASS [{i}]: STATIC region but model_end={model_end_raw:.1f}s "
+                    f"covers only {model_coverage:.0%} of {video_duration:.1f}s — extending to full"
+                )
+                model_end_valid = False  # Fall through to static handler
+
+        if is_static_region and not model_end_valid:
+            # Static text with no valid model end: force full video duration
+            appears_at = -0.05 if appears_at < 0.05 else appears_at
             disappears_at = video_duration
-        # Safety: ensure at least 2s display time if times are nonsensical
-        if disappears_at <= appears_at:
-            disappears_at = appears_at + 2.0
+            logger.info(
+                f"RENDER_TEXT ASS [{i}]: STATIC region '{matched_region_for_timing.get('id', '?')}' "
+                f"— forcing full duration 0..{video_duration:.1f}s"
+            )
+        elif model_end_valid:
+            # Explicit timing from model (non-static region, or static with good coverage)
+            disappears_at = min(video_duration, model_end_raw)
+            logger.info(
+                f"RENDER_TEXT ASS [{i}]: using model timing "
+                f"{appears_at:.1f}..{disappears_at:.1f}s (explicit)"
+            )
+        else:
+            # Hybrid timing resolution:
+            # - bridge to next overlay start (by position/zone);
+            # - avoid indefinite slabs by max-hold clamp later.
+            pos_starts = _next_start_by_pos.get(position, [])
+            zone_starts = _next_start_by_zone.get(overlay_zone, [])
+            next_same_pos = _next_future_start(pos_starts, appears_at, min_gap=0.35)
+            next_same_zone = _next_future_start(zone_starts, appears_at, min_gap=0.35)
+            next_candidates = [t for t in (next_same_pos, next_same_zone) if t is not None]
+            next_start = min(next_candidates) if next_candidates else None
+
+            if next_start is not None:
+                disappears_at = min(video_duration, next_start)
+            else:
+                disappears_at = video_duration
+
+            if next_start is not None:
+                disappears_at = min(disappears_at, next_start)
+
+            # Safety: minimum display time.
+            if disappears_at <= appears_at + 0.2:
+                disappears_at = appears_at + 2.0
+
+            # FIX: If disappears_at is very close to appears_at (model gave bad data)
+            # and there's no next overlay, extend to video end
+            if disappears_at <= appears_at + 0.5 and next_start is None:
+                disappears_at = video_duration
 
         # Determine render strategy from adaptive pipeline
         matched_region = _match_overlay_to_region(overlay, text_regions)
+        if not matched_region and text_regions:
+            # Fallback: if exactly one region exists in this zone, use it.
+            # This avoids defaulting to replace_inplace with a bad OCR fallback bbox.
+            zone_candidates = [r for r in text_regions if r.get("zone", "middle") == overlay_zone]
+            if len(zone_candidates) == 1:
+                matched_region = zone_candidates[0]
+                logger.info(
+                    f"RENDER_TEXT ASS [{i}]: zone fallback matched region "
+                    f"'{matched_region.get('id', '?')}' for zone='{overlay_zone}'"
+                )
+        render_region = matched_region
+        if matched_region and matched_region.get("bbox_norm"):
+            render_region = _stabilize_matched_region_bbox(
+                overlay=overlay,
+                region=matched_region,
+                overlay_zone=overlay_zone,
+                appears_at=appears_at,
+                temporal_state=_bbox_temporal_state,
+            )
         if matched_region:
-            strategy = render_strategies.get(matched_region["id"], "replace_inplace")
-            logger.info(f"RENDER_TEXT ASS [{i}]: matched region '{matched_region['id']}', strategy='{strategy}'")
+            region_id = matched_region.get("id")
+            strategy = render_strategies.get(region_id, "replace_inplace")
+            logger.info(
+                f"RENDER_TEXT ASS [{i}]: matched region '{matched_region.get('id', '?')}', "
+                f"strategy='{strategy}'"
+            )
         else:
             strategy = "replace_inplace"  # Default fallback
+
+        # Final timing guard based on text/region/strategy.
+        max_hold = _estimate_overlay_max_hold_seconds(
+            translated_text=translated_text,
+            region=render_region,
+            strategy=strategy,
+        )
+        if (disappears_at - appears_at) > max_hold:
+            old_end = disappears_at
+            disappears_at = min(disappears_at, appears_at + max_hold)
+            logger.info(
+                "TIMING_GUARD: clamped overlay[%s] zone=%s strategy=%s duration %.2fs -> %.2fs",
+                i,
+                overlay_zone,
+                strategy,
+                old_end - appears_at,
+                disappears_at - appears_at,
+            )
+
+        # Duplicate suppression in same zone (model sometimes emits near-identical clones).
+        prev_zone = _zone_dedupe_state.get(overlay_zone)
+        if prev_zone:
+            prev_end = _safe_float(prev_zone.get("end"), -1.0)
+            prev_text = str(prev_zone.get("text", ""))
+            sim = _levenshtein_ratio(translated_text.lower(), prev_text.lower()) if prev_text else 0.0
+            if appears_at <= (prev_end + 0.08) and sim >= 0.86:
+                logger.info(
+                    "TIMING_GUARD: skipped duplicate overlay[%s] zone=%s sim=%.2f",
+                    i,
+                    overlay_zone,
+                    sim,
+                )
+                continue
+
+        # FIX: When inpainting failed, non-watermark regions MUST use subtitle_snap.
+        # backplate_overlay draws a fully opaque black rectangle (eraser plate) which
+        # looks terrible for captions/subtitles/usernames. Only watermarks should get
+        # eraser plates — everything else gets a styled overlay on top of original text.
+        # This applies to ALL strategies that could produce eraser plates:
+        # backplate_overlay (opaque rect) and replace_inplace (may show through).
+        if not inpaint_succeeded and render_region:
+            region_type = render_region.get("type", "").lower()
+            if region_type not in ("watermark", "logo"):
+                if strategy in ("backplate_overlay", "replace_inplace"):
+                    logger.info(
+                        f"RENDER_TEXT ASS [{i}]: ERASER PLATE DISABLED for non-watermark region "
+                        f"(type='{region_type}', was='{strategy}'). Switching to subtitle_snap."
+                    )
+                    strategy = "subtitle_snap"
 
         # Handle skip strategy
         if strategy == "skip":
@@ -2959,43 +5017,57 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             continue
 
         # Handle backplate_overlay strategy
-        if strategy == "backplate_overlay" and matched_region:
+        if strategy == "backplate_overlay" and render_region:
             # Pass adjusted times (disappears_at may have been extended to video_duration)
             overlay_with_times = {**overlay, "appears_at": appears_at, "disappears_at": disappears_at}
             _render_backplate_overlay(
-                ass_lines, overlay_with_times, matched_region,
+                ass_lines, overlay_with_times, render_region,
                 video_width, video_height, font_size,
                 is_rtl=is_rtl, target_language=target_language,
                 caption_style=caption_style,
             )
+            _zone_dedupe_state[overlay_zone] = {"text": translated_text, "end": disappears_at}
             continue
 
         # Handle subtitle_snap strategy (Pipeline A)
-        if strategy == "subtitle_snap" and matched_region:
+        if strategy == "subtitle_snap" and render_region:
             _render_subtitle_snap(
                 ass_lines, {**overlay, "appears_at": appears_at, "disappears_at": disappears_at},
-                matched_region, video_width, video_height, font_size,
+                render_region, video_width, video_height, font_size,
                 is_rtl=is_rtl, target_language=target_language,
                 caption_style=caption_style,
             )
+            _zone_dedupe_state[overlay_zone] = {"text": translated_text, "end": disappears_at}
             continue
 
         # Handle blur_plate_overlay strategy (Pipeline B)
-        if strategy == "blur_plate_overlay" and matched_region:
+        if strategy == "blur_plate_overlay" and render_region:
             _render_blur_plate_overlay(
                 ass_lines, {**overlay, "appears_at": appears_at, "disappears_at": disappears_at},
-                matched_region, video_width, video_height, font_size,
+                render_region, video_width, video_height, font_size,
                 is_rtl=is_rtl, target_language=target_language,
                 caption_style=caption_style,
             )
+            _zone_dedupe_state[overlay_zone] = {"text": translated_text, "end": disappears_at}
             continue
 
         # Default: replace_inplace (or subtitle_bottom) — original behavior
-        # Get bounding box from OCR (zone + time filtered)
-        x, y, box_w, box_h = _find_overlay_bbox(
-            overlay, text_detections, video_width, video_height,
-            appears_at=appears_at, disappears_at=disappears_at, video_fps=video_fps
-        )
+        # If we have a matched region with bbox, use it directly (more reliable than OCR zone search)
+        if render_region and render_region.get("bbox_norm"):
+            bbox = _normalize_bbox(render_region.get("bbox_norm", [0, 0.85, 1, 1]), video_width, video_height)
+            pad_x = (bbox[2] - bbox[0]) * 0.10
+            pad_y = (bbox[3] - bbox[1]) * 0.15
+            x = max(0, int((bbox[0] - pad_x) * video_width))
+            y = max(0, int((bbox[1] - pad_y) * video_height))
+            box_w = min(video_width, int((bbox[2] - bbox[0] + 2 * pad_x) * video_width))
+            box_h = max(int(video_height * 0.04), int((bbox[3] - bbox[1] + 2 * pad_y) * video_height))
+            logger.info(f"RENDER_TEXT ASS [{i}]: using matched region bbox: ({x},{y},{box_w}x{box_h})")
+        else:
+            # Fallback: search OCR detections by zone + time
+            x, y, box_w, box_h = _find_overlay_bbox(
+                overlay, text_detections, video_width, video_height,
+                appears_at=appears_at, disappears_at=disappears_at, video_fps=video_fps
+            )
 
         # Format times
         start_time = _format_ass_time(appears_at)
@@ -3027,9 +5099,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 safe_text = get_display(reshaped)
             except ImportError:
                 logger.warning("arabic_reshaper/python-bidi not installed, RTL rendering may be incorrect")
-            style_name = "TranslatedTextRTL"
+            style_name = "TranslatedTextNoBoxRTL"
         else:
-            style_name = "TranslatedText"
+            style_name = "TranslatedTextNoBox"
 
         # Position: center of OCR bbox
         cx = x + box_w // 2
@@ -3042,6 +5114,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f"{{\\an5\\pos({cx},{cy})\\fad(200,200)}}{safe_text}"
         )
         ass_lines.append(text_event)
+        _zone_dedupe_state[overlay_zone] = {"text": translated_text, "end": disappears_at}
 
         logger.info(
             f"RENDER_TEXT ASS [{i}]: strategy='{strategy}' position='{position}' "
@@ -3078,8 +5151,10 @@ def stage_render_text(
     - Safe zone awareness (avoid TikTok UI elements)
     - Backplate rendering (adaptive pipeline: color-matched plates)
 
-    When inpaint_succeeded=False, eraser plates use fully opaque black
-    to ensure original text is covered.
+    When inpaint_succeeded=False:
+    - Watermark/logo regions: eraser plates (opaque black) to cover branding
+    - All other regions (caption, subtitle, username): forced to subtitle_snap
+      for styled overlay rendering — no black rectangles on content
 
     Zero VRAM — pure CPU/ffmpeg.
     """
@@ -3216,7 +5291,8 @@ def stage_translate(text: str, source_lang: str, target_lang: str) -> str:
 
 
 def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en",
-                    voice_id: Optional[str] = None, campaign_id: Optional[int] = None) -> Optional[Tuple[str, str]]:
+                    voice_id: Optional[str] = None, campaign_id: Optional[int] = None,
+                    speed: float = 1.0) -> Optional[Tuple[str, str]]:
     """Generate speech using ElevenLabs API (best quality, runs from GPU worker IP to avoid geo-blocks).
 
     Args:
@@ -3273,6 +5349,7 @@ def _tts_elevenlabs(text: str, reference_audio: str, target_language: str = "en"
                     "stability": 0.5,
                     "similarity_boost": 0.85,
                     "style": 0.3,
+                    "speed": speed,
                 },
             }
             # Add language_code for eleven_v3 (supports 70+ languages)
@@ -3328,21 +5405,36 @@ def _tts_f5(text: str, reference_audio: str, mm: ModelManager) -> str:
 
 
 def stage_tts(text: str, reference_audio: str, mm: ModelManager, target_language: str = "en",
-              voice_id: Optional[str] = None, campaign_id: Optional[int] = None) -> Tuple[str, str, Optional[str]]:
-    """Generate speech: ElevenLabs API (primary) → F5-TTS local (fallback).
+              voice_id: Optional[str] = None, campaign_id: Optional[int] = None,
+              original_transcript: Optional[str] = None) -> Tuple[str, str, Optional[str]]:
+    """Generate speech using ElevenLabs API (only engine — F5-TTS removed).
     Returns: (audio_path, method_used, voice_id_for_persistence)
+    Raises RuntimeError if ElevenLabs fails (TTS is a critical stage).
     """
-    logger.info(f"Stage: TTS (target_language={target_language}, voice_id={'reuse' if voice_id else 'clone'}, campaign={campaign_id})")
+    # Calculate speech speed based on text length ratio.
+    # When translation is significantly longer (e.g. RU→EN), slow down to avoid rushing.
+    speed = 1.0
+    source_chars = len(original_transcript or "")
+    target_chars = len(text or "")
+    if source_chars > 0 and target_chars > source_chars * 1.2:
+        ratio = source_chars / target_chars
+        speed = max(0.8, min(1.0, ratio * 1.05))  # Clamp 0.8-1.0
+    logger.info(f"Stage: TTS (target_language={target_language}, voice_id={'reuse' if voice_id else 'clone'}, "
+                f"campaign={campaign_id}, speed={speed:.2f}, src={source_chars} chars, tgt={target_chars} chars)")
 
-    # Primary: ElevenLabs (runs from US GPU IP — no geo-block)
+    # ElevenLabs only (runs from US GPU IP — no geo-block)
     result = _tts_elevenlabs(text, reference_audio, target_language=target_language,
-                             voice_id=voice_id, campaign_id=campaign_id)
+                             voice_id=voice_id, campaign_id=campaign_id, speed=speed)
     if result:
         audio_path, used_voice_id = result
         return audio_path, "elevenlabs", used_voice_id
 
-    # Fallback: F5-TTS on local GPU (no voice persistence)
-    return _tts_f5(text, reference_audio, mm), "f5tts", None
+    # No fallback — ElevenLabs is the only TTS engine.
+    # F5-TTS removed: sounds robotic and degrades quality.
+    raise RuntimeError(
+        "ElevenLabs TTS failed and no fallback available. "
+        "Check ELEVENLABS_API_KEY env var and API quota."
+    )
 
 
 def stage_lipsync(video_path: str, audio_path: str, quality: str, mm: ModelManager) -> str:
@@ -3523,55 +5615,330 @@ def stage_quality_check(video_path: str, threshold: float) -> Dict:
     }
 
 
+def stage_dubbing(video_url: str, source_lang: str, target_lang: str,
+                   video_path: str) -> str:
+    """ElevenLabs Dubbing API — replaces preprocess+transcribe+translate+tts+assemble.
+
+    Sends the video URL to ElevenLabs, which handles:
+    - Transcription (auto speaker detection)
+    - Translation to target language
+    - Voice cloning of original speaker(s)
+    - Audio mixing with background music/sounds
+
+    Returns path to the dubbed audio file (MP3/MP4).
+    The caller must then replace the video's audio track with this.
+    """
+    import httpx
+
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY not set — dubbing requires ElevenLabs API")
+
+    logger.info(f"Stage: DUBBING (ElevenLabs) {source_lang}→{target_lang}")
+
+    # Step 1: Create dubbing job — upload file directly (not source_url)
+    # R2 URLs return application/octet-stream which ElevenLabs rejects.
+    # We must upload the local video file with explicit video/mp4 MIME type.
+    if not os.path.exists(video_path):
+        raise RuntimeError(f"Video file not found: {video_path}")
+
+    with httpx.Client(timeout=120) as client:
+        with open(video_path, "rb") as vf:
+            resp = client.post(
+                "https://api.elevenlabs.io/v1/dubbing",
+                headers={"xi-api-key": api_key},
+                data={
+                    "source_lang": source_lang if source_lang != "auto" else "auto",
+                    "target_lang": target_lang,
+                    "num_speakers": "0",
+                    "watermark": "false",
+                },
+                files={"file": ("video.mp4", vf, "video/mp4")},
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(f"ElevenLabs dubbing create failed: {resp.status_code} {resp.text[:300]}")
+
+        dub_data = resp.json()
+        dubbing_id = dub_data.get("dubbing_id")
+        expected = dub_data.get("expected_duration_sec", 0)
+        if not dubbing_id:
+            raise RuntimeError(f"ElevenLabs dubbing: no dubbing_id returned: {dub_data}")
+
+    logger.info(f"ElevenLabs dubbing created: {dubbing_id} (expected ~{expected:.0f}s)")
+
+    # Step 2: Poll until done (max 10 minutes)
+    max_wait = 600
+    poll_interval = 5
+    elapsed = 0
+
+    with httpx.Client(timeout=30) as client:
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+            resp = client.get(
+                f"https://api.elevenlabs.io/v1/dubbing/{dubbing_id}",
+                headers={"xi-api-key": api_key},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"ElevenLabs dubbing poll failed: {resp.status_code}")
+                continue
+
+            status_data = resp.json()
+            status = status_data.get("status", "unknown")
+            logger.info(f"ElevenLabs dubbing {dubbing_id}: status={status} ({elapsed}s)")
+
+            if status == "dubbed":
+                break
+            elif status in ("failed", "error"):
+                error_msg = status_data.get("error", "unknown error")
+                raise RuntimeError(f"ElevenLabs dubbing failed: {error_msg}")
+
+        else:
+            raise RuntimeError(f"ElevenLabs dubbing timed out after {max_wait}s")
+
+    # Step 3: Download dubbed audio
+    logger.info(f"ElevenLabs dubbing complete, downloading audio for {target_lang}...")
+
+    output_path = video_path.replace(".mp4", f"_dubbed_{target_lang}.mp4")
+
+    with httpx.Client(timeout=120) as client:
+        resp = client.get(
+            f"https://api.elevenlabs.io/v1/dubbing/{dubbing_id}/audio/{target_lang}",
+            headers={"xi-api-key": api_key},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"ElevenLabs dubbing download failed: {resp.status_code} {resp.text[:200]}")
+
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+
+    logger.info(f"ElevenLabs dubbing: downloaded {len(resp.content)} bytes → {output_path}")
+    return output_path
+
+
+def _verify_text_removal(output_path: str, source_lang: str, mm: "ModelManager",
+                         num_frames: int = 6) -> Dict[str, Any]:
+    """
+    Post-pipeline quality gate: extract frames from output video, run OCR,
+    check for remaining source-language text.
+
+    Returns a quality report with detection count and text_removal_score (0-100).
+    """
+    import cv2
+    import subprocess
+
+    logger.info(f"QUALITY_GATE: verifying text removal on {output_path} (source_lang={source_lang})")
+
+    if not os.path.exists(output_path):
+        return {"source_text_found": False, "detection_count": 0, "detections": [],
+                "text_removal_score": 100, "error": "output file not found"}
+
+    # Get video duration
+    dur_result = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", output_path
+    ], capture_output=True, text=True)
+    duration = float(dur_result.stdout.strip()) if dur_result.returncode == 0 else 0
+    if duration <= 0:
+        return {"source_text_found": False, "detection_count": 0, "detections": [],
+                "text_removal_score": 100, "error": "could not determine duration"}
+
+    # Extract evenly-spaced frames using cv2
+    cap = cv2.VideoCapture(output_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    interval = max(1, total_frames // (num_frames + 1))
+
+    # Load PaddleOCR (should already be loaded from detect_text stage)
+    try:
+        ocr = mm.load("paddleocr")
+    except Exception as e:
+        cap.release()
+        logger.warning(f"QUALITY_GATE: PaddleOCR load failed: {e}")
+        return {"source_text_found": False, "detection_count": 0, "detections": [],
+                "text_removal_score": -1, "error": str(e)}
+
+    detections = []
+    for i in range(num_frames):
+        frame_idx = interval * (i + 1)
+        if frame_idx >= total_frames:
+            break
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        timestamp = frame_idx / fps
+
+        try:
+            result = ocr.ocr(frame, cls=False)
+            if result and result[0]:
+                for line in result[0]:
+                    text = line[1][0]
+                    conf = line[1][1]
+                    if conf > 0.6 and len(text) > 1:
+                        if _is_source_language_text(text, source_lang):
+                            detections.append({
+                                "frame": i,
+                                "frame_idx": frame_idx,
+                                "timestamp": round(timestamp, 2),
+                                "text": text,
+                                "confidence": round(conf, 3),
+                            })
+        except Exception as e:
+            logger.warning(f"QUALITY_GATE: OCR failed on frame {frame_idx}: {e}")
+
+    cap.release()
+
+    # Score: 100 = perfect removal, each detection costs 15 points
+    score = max(0, 100 - len(detections) * 15)
+
+    report = {
+        "source_text_found": len(detections) > 0,
+        "detection_count": len(detections),
+        "detections": detections[:10],  # Limit to first 10
+        "text_removal_score": score,
+    }
+
+    if detections:
+        texts = [d["text"] for d in detections[:5]]
+        logger.warning(
+            f"QUALITY_GATE: {len(detections)} source-language text fragments still visible! "
+            f"score={score}/100 samples={texts}"
+        )
+    else:
+        logger.info(f"QUALITY_GATE: PASS — no source-language text detected (score={score}/100)")
+
+    return report
+
+
+def _is_source_language_text(text: str, lang: str) -> bool:
+    """Check if text contains characters from the source language."""
+    lang = (lang or "").lower().split("-")[0]
+    if lang in ("ru", "russian"):
+        # Cyrillic characters
+        return any('\u0400' <= c <= '\u04FF' for c in text)
+    elif lang in ("zh", "chinese"):
+        # CJK Unified Ideographs
+        return any('\u4E00' <= c <= '\u9FFF' for c in text)
+    elif lang in ("ja", "japanese"):
+        # Hiragana + Katakana + CJK
+        return any(('\u3040' <= c <= '\u309F') or ('\u30A0' <= c <= '\u30FF') or ('\u4E00' <= c <= '\u9FFF') for c in text)
+    elif lang in ("ko", "korean"):
+        # Hangul
+        return any('\uAC00' <= c <= '\uD7AF' for c in text)
+    elif lang in ("ar", "arabic"):
+        # Arabic script
+        return any('\u0600' <= c <= '\u06FF' for c in text)
+    elif lang in ("he", "hebrew"):
+        return any('\u0590' <= c <= '\u05FF' for c in text)
+    elif lang in ("th", "thai"):
+        return any('\u0E00' <= c <= '\u0E7F' for c in text)
+    elif lang in ("hi", "hindi"):
+        # Devanagari
+        return any('\u0900' <= c <= '\u097F' for c in text)
+    # For Latin-script source languages, we cannot easily distinguish from target
+    # (e.g., Portuguese source vs English target both use Latin chars)
+    return False
+
+
 def stage_assemble(
     video_path: str,
     tts_audio: Optional[str],
     background_audio: Optional[str],
     output_path: str
 ) -> str:
-    """Assemble final video with mixed audio."""
+    """Assemble final video with mixed audio.
+
+    Rules for localized output:
+    - TTS + background: Mix TTS (full volume) + background (30%), fade out last 500ms
+    - TTS only: Use TTS audio with fade out
+    - No TTS + background: Use background only (vocals already stripped by Demucs)
+    - No TTS + no background: Strip all audio (silent video — NEVER keep original vocals)
+    """
     logger.info("Stage: ASSEMBLE")
 
+    # Get video duration for fade-out calculation
+    duration_result = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", video_path
+    ], capture_output=True, text=True)
+    video_duration = float(duration_result.stdout.strip()) if duration_result.returncode == 0 else 0
+    fade_start = max(0, video_duration - 0.5) if video_duration > 0.5 else 0
+
     if not tts_audio:
-        # Speechless video — just copy video with original audio (text-only localization)
-        logger.info("No TTS audio — assembling with original audio only")
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-c", "copy",
-            output_path
-        ], capture_output=True, check=False)
+        # No TTS — use background-only audio (vocals stripped) or go silent.
+        # NEVER copy original audio — it contains source-language vocals.
+        if background_audio and os.path.exists(background_audio):
+            logger.info("No TTS audio — using Demucs background only (vocals stripped)")
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", background_audio,
+                "-c:v", "copy",
+                "-af", f"afade=t=out:st={fade_start}:d=0.5",
+                "-c:a", "aac",
+                "-ar", "44100",
+                "-ac", "2",
+                "-map", "0:v",
+                "-map", "1:a",
+                "-shortest",
+                output_path
+            ], capture_output=True, check=False)
+        else:
+            # No Demucs ran, no TTS — this is a text-only video (music/ambient only).
+            # Preserve original audio since there's no source-language speech to hide.
+            logger.info("No TTS audio, no background audio — preserving original audio (text-only pipeline)")
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-ar", "44100",
+                "-ac", "2",
+                output_path
+            ], capture_output=True, check=False)
         if not os.path.exists(output_path):
             raise RuntimeError(f"ffmpeg assemble (no-TTS) failed — output not created: {output_path}")
         return output_path
 
     if background_audio and os.path.exists(background_audio):
-        # Mix TTS voice with background audio using sidechain ducking:
-        # Background plays at ~70% volume, ducks to ~25% when TTS voice is active.
-        # This gives clean dubbing: voice is clear, background music/SFX preserved.
+        # Mix TTS voice with background audio.
+        # TTS at full volume, background at 30% (ducked).
+        # 500ms fade-out at end to prevent audio tail leak.
+        #
+        # CRITICAL: Resample BOTH inputs to 44100Hz stereo FIRST.
+        # ElevenLabs outputs ~44.1kHz, Demucs 44.1kHz stereo.
         mixed_audio = output_path.replace(".mp4", "_mixed.wav")
-        subprocess.run([
+        result = subprocess.run([
             "ffmpeg", "-y",
             "-i", tts_audio,
             "-i", background_audio,
             "-filter_complex",
-            # Sidechain compressor: TTS voice triggers ducking on background
-            # [1:a] background gets compressed when [0:a] TTS is loud
-            # threshold=-25dB: start ducking when TTS > -25dB
-            # ratio=3: moderate ducking (not too aggressive)
-            # attack=50ms: fast attack when voice starts
-            # release=300ms: smooth release when voice stops
-            # Then mix: TTS at full volume + ducked background at 70%
-            "[1:a]volume=0.7[bg];"
-            "[bg][0:a]sidechaincompress=threshold=0.02:ratio=3:attack=50:release=300:level_sc=1[ducked];"
-            "[0:a][ducked]amix=inputs=2:duration=longest:weights=1 1[a]",
+            # Resample both to same format, mix, then fade out last 500ms
+            "[0:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[tts];"
+            "[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.3[bg];"
+            f"[tts][bg]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,afade=t=in:st=0:d=0.2,afade=t=out:st={fade_start}:d=0.5[a]",
             "-map", "[a]",
+            "-ar", "44100", "-ac", "2",
             mixed_audio
         ], capture_output=True, check=False)
+        if result.returncode != 0:
+            stderr = result.stderr.decode()[-500:] if result.stderr else "unknown"
+            logger.warning(f"Audio mixing failed (rc={result.returncode}): {stderr}")
         audio_to_use = mixed_audio if os.path.exists(mixed_audio) else tts_audio
     else:
-        # No background audio — use TTS audio directly
-        audio_to_use = tts_audio
+        # No background audio — use TTS audio directly (still apply fade-out)
+        faded_tts = output_path.replace(".mp4", "_faded_tts.wav")
+        result = subprocess.run([
+            "ffmpeg", "-y",
+            "-i", tts_audio,
+            "-af", f"aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,afade=t=out:st={fade_start}:d=0.5",
+            "-ar", "44100", "-ac", "2",
+            faded_tts
+        ], capture_output=True, check=False)
+        audio_to_use = faded_tts if (result.returncode == 0 and os.path.exists(faded_tts)) else tts_audio
 
     # Combine video with audio
     subprocess.run([
@@ -3580,6 +5947,8 @@ def stage_assemble(
         "-i", audio_to_use,
         "-c:v", "copy",
         "-c:a", "aac",
+        "-ar", "44100",
+        "-ac", "2",
         "-map", "0:v",
         "-map", "1:a",
         "-shortest",
@@ -3718,6 +6087,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if diag and diag.get("errors"):
         logger.warning(f"VideoPainter issues: {diag['errors']}")
 
+    # Ensure geo-aware fonts are downloaded and registered (lazy init, cached)
+    try:
+        _ensure_geo_fonts()
+    except Exception as e:
+        logger.warning(f"Font initialization failed (non-fatal): {e}")
+
     start_time = time.time()
 
     # Validate input
@@ -3739,6 +6114,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             stages=job_input.get("stages"),
             callback_url=job_input.get("callback_url"),
             translated_text=job_input.get("translated_text"),  # Pre-translated from server
+            original_transcript=job_input.get("original_transcript"),  # Source text for TTS speed calc
             translated_overlays=job_input.get("translated_overlays"),  # Pre-translated text overlays
             subtitle_style=job_input.get("subtitle_style"),  # Original subtitle style from manifest
             elevenlabs_voice_id=job_input.get("elevenlabs_voice_id"),  # Persisted voice ID
@@ -3756,6 +6132,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if video_profile:
             logger.info(f"ADAPTIVE: VideoProfile loaded — type={video_profile.get('video_type')}, "
                         f"{len(video_profile.get('text_regions', []))} text regions")
+            asp = video_profile.get("account_style_profile", {}) or {}
+            if asp:
+                logger.info(
+                    "ADAPTIVE: AccountStyle profile loaded — container=%s density=%s emphasis=%s overlays=%s",
+                    asp.get("container_preference"),
+                    asp.get("density"),
+                    asp.get("emphasis"),
+                    asp.get("overlay_count"),
+                )
             pipeline_config = video_profile.get("pipeline_config", {})
         else:
             logger.info("ADAPTIVE: No VideoProfile, using defaults")
@@ -3792,6 +6177,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "mask_path": None,
             "tts_audio": None,
             "transcript": None,
+            "translated_text": config.translated_text,  # Pre-loaded from server (Gemini 3 Pro)
             "video_profile": video_profile,
             "pipeline_config": pipeline_config,
         }
@@ -3833,11 +6219,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         skip_ocr = pipeline_types and pipeline_types.issubset({"subtitle_snap", "blur_plate"})
 
                     if skip_ocr:
-                        logger.info("DETECT_TEXT: Skipped — all regions use subtitle_snap/blur_plate")
-                        state["text_detections"] = []
-                        state["text_resolution"] = (1920, 1080)  # Default
-                        state["text_fps"] = 30.0
-                    else:
+                        logger.info("DETECT_TEXT: All regions use subtitle_snap/blur_plate — running OCR for precise bbox positioning")
+                    # Always run OCR when detect_text is in stages — gives precise bboxes
+                    if True:
                         result = stage_detect_text(state["video_path"], mm, pipeline_config=state.get("pipeline_config"))
                         state["text_detections"] = result["detections"]
                         state["text_resolution"] = result["resolution"]  # (width, height)
@@ -3867,15 +6251,35 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     # Determine which pipelines are needed
                     needs_inpaint = False
                     blur_regions = []
+                    snap_blur_regions = []  # subtitle_snap regions that need pre-blur
+
+                    # Build set of region IDs that have non-empty translated text.
+                    # Only blur/inpaint regions that will actually get text rendered;
+                    # otherwise we leave visible blur patches with no overlay text.
+                    _renderable_region_ids = set()
+                    if config.translated_overlays:
+                        for _ov in config.translated_overlays:
+                            _tt = (_ov.get("translated_text") or "").strip()
+                            _rid = _ov.get("region_id", "")
+                            if _tt and _rid:
+                                _renderable_region_ids.add(_rid)
 
                     if state.get("video_profile"):
                         text_regions = state["video_profile"].get("text_regions", [])
                         for r in text_regions:
                             pt = r.get("pipeline_type", "inpaint_backplate")
+                            rid = r.get("id", "")
+                            # Skip regions whose translated overlay is empty/garbage
+                            if _renderable_region_ids and rid and rid not in _renderable_region_ids:
+                                logger.info(f"INPAINT: Skipping region '{rid}' — no translated text to render")
+                                continue
                             if pt == "inpaint_backplate":
                                 needs_inpaint = True
                             elif pt == "blur_plate":
                                 blur_regions.append(r)
+                            elif pt == "subtitle_snap":
+                                # Pre-blur to remove original text before overlay
+                                snap_blur_regions.append(r)
                     else:
                         needs_inpaint = True  # No profile = default behavior
 
@@ -3905,9 +6309,28 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                             )
                         except Exception as e:
                             logger.warning(f"BLUR_PLATE failed (non-fatal): {e}")
+
+                    # Pre-blur subtitle_snap regions to erase original text
+                    # before ASS overlay is rendered on top
+                    if snap_blur_regions:
+                        try:
+                            logger.info(f"INPAINT: Pre-blurring {len(snap_blur_regions)} subtitle_snap regions to remove original text")
+                            state["video_path"] = stage_blur_plate(
+                                state["video_path"], snap_blur_regions,
+                                video_profile=state.get("video_profile"),
+                            )
+                        except Exception as e:
+                            logger.warning(f"SNAP_PRE_BLUR failed (non-fatal): {e}")
                             metrics.errors.append(f"blur_plate: {str(e)}")
 
                 elif stage_name == "render_text":
+                    # Refine Gemini bboxes with precise OCR detections (if available)
+                    if state.get("text_detections") and state.get("video_profile"):
+                        vp = state["video_profile"]
+                        vp["text_regions"] = _refine_regions_from_ocr(
+                            vp.get("text_regions", []),
+                            state["text_detections"],
+                        )
                     if config.translated_overlays:
                         state["video_path"] = stage_render_text(
                             state["video_path"],
@@ -3959,6 +6382,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                             target_language=config.target_language,
                             voice_id=config.elevenlabs_voice_id,
                             campaign_id=config.campaign_id,
+                            original_transcript=config.original_transcript,
                         )
                         state["tts_audio"] = tts_result
                         state["cloned_voice_id"] = used_voice_id
@@ -4000,6 +6424,23 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         state.get("background_path"),
                         output_path
                     )
+
+                    # Post-assembly quality gate: verify source text was removed
+                    try:
+                        qg_report = _verify_text_removal(
+                            state["video_path"],
+                            source_lang=config.source_language,
+                            mm=mm,
+                        )
+                        if qg_report.get("source_text_found"):
+                            metrics.quality_warnings.append(
+                                f"source_text_visible: {qg_report['detection_count']} detections, "
+                                f"score={qg_report['text_removal_score']}/100"
+                            )
+                        metrics.quality_scores["text_removal"] = qg_report
+                    except Exception as e:
+                        logger.warning(f"QUALITY_GATE: verification failed (non-fatal): {e}")
+                        metrics.errors.append(f"quality_gate: {str(e)}")
 
             except Exception as e:
                 import traceback
